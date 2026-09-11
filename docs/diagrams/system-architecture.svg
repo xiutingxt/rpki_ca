@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040" viewBox="0 0 1600 1040" role="img" aria-labelledby="title desc">
+  <title id="title">rpki-ca 系统架构图</title>
+  <desc id="desc">展示前端和运维入口、HTTP 与 CLI 接口、应用服务、RPKI 领域组件，以及端口与本地适配器之间的调用关系。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#475569"/></marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#0f172a" flood-opacity="0.12"/></filter>
+    <style>
+      .bg{fill:#f8fafc}.frame{fill:#fff;stroke:#cbd5e1;stroke-width:2}.layer{fill:#f1f5f9;stroke:#94a3b8;stroke-width:2}.entry{fill:#e0f2fe;stroke:#0284c7;stroke-width:2}.app{fill:#ede9fe;stroke:#7c3aed;stroke-width:2}.domain{fill:#dcfce7;stroke:#16a34a;stroke-width:2}.infra{fill:#ffedd5;stroke:#ea580c;stroke-width:2}.store{fill:#fef3c7;stroke:#d97706;stroke-width:2}.title{font:700 34px 'Segoe UI','Microsoft YaHei',sans-serif;fill:#0f172a}.subtitle{font:400 17px 'Segoe UI','Microsoft YaHei',sans-serif;fill:#475569}.layer-title{font:700 19px 'Segoe UI','Microsoft YaHei',sans-serif;fill:#334155}.node-title{font:700 18px 'Segoe UI','Microsoft YaHei',sans-serif;fill:#0f172a}.node-text{font:400 14px 'Segoe UI','Microsoft YaHei',sans-serif;fill:#334155}.edge{fill:none;stroke:#475569;stroke-width:2.5;marker-end:url(#arrow)}.edge-dashed{fill:none;stroke:#64748b;stroke-width:2;stroke-dasharray:8 7;marker-end:url(#arrow)}.edge-label{font:600 13px 'Segoe UI','Microsoft YaHei',sans-serif;fill:#475569}.badge{font:700 12px 'Segoe UI','Microsoft YaHei',sans-serif;fill:#fff}.legend{font:400 13px 'Segoe UI','Microsoft YaHei',sans-serif;fill:#475569}
+    </style>
+  </defs>
+  <rect class="bg" width="1600" height="1040"/>
+  <text class="title" x="70" y="62">rpki-ca 系统架构</text>
+  <text class="subtitle" x="70" y="94">单一 Rust 二进制 · CLI 与 HTTP 复用同一领域流程 · 核心不依赖文件系统</text>
+
+  <rect class="frame" x="50" y="125" width="1500" height="845" rx="18" filter="url(#shadow)"/>
+
+  <rect class="layer" x="80" y="155" width="1440" height="145" rx="14"/>
+  <text class="layer-title" x="105" y="187">使用者与入口</text>
+  <rect class="entry" x="150" y="210" width="265" height="64" rx="10"/>
+  <text class="node-title" x="282" y="238" text-anchor="middle">前端 / API Client</text><text class="node-text" x="282" y="260" text-anchor="middle">JSON · Bearer Token · Idempotency-Key</text>
+  <rect class="entry" x="665" y="210" width="265" height="64" rx="10"/>
+  <text class="node-title" x="797" y="238" text-anchor="middle">运维人员 / Scheduler</text><text class="node-text" x="797" y="260" text-anchor="middle">init · import · sign-roa · refresh</text>
+  <rect class="entry" x="1180" y="210" width="265" height="64" rx="10"/>
+  <text class="node-title" x="1312" y="238" text-anchor="middle">Docker Compose</text><text class="node-text" x="1312" y="260" text-anchor="middle">环境变量 · 持久卷 · 端口</text>
+
+  <rect class="layer" x="80" y="325" width="1440" height="150" rx="14"/>
+  <text class="layer-title" x="105" y="357">接口层</text>
+  <rect class="entry" x="210" y="380" width="380" height="68" rx="10"/>
+  <text class="node-title" x="400" y="408" text-anchor="middle">HTTP API · api.rs</text><text class="node-text" x="400" y="431" text-anchor="middle">鉴权 · 幂等 · CORS · 写请求串行化</text>
+  <rect class="entry" x="1010" y="380" width="380" height="68" rx="10"/>
+  <text class="node-title" x="1200" y="408" text-anchor="middle">CLI · main.rs</text><text class="node-text" x="1200" y="431" text-anchor="middle">参数解析 · JSON 输入 · serve 启动</text>
+
+  <rect class="layer" x="80" y="500" width="1440" height="115" rx="14"/>
+  <text class="layer-title" x="105" y="532">应用层</text>
+  <rect class="app" x="500" y="540" width="600" height="52" rx="10"/>
+  <text class="node-title" x="800" y="568" text-anchor="middle">CaManager · 统一应用用例入口</text><text class="node-text" x="800" y="586" text-anchor="middle">init · import · open · sign_roa · refresh</text>
+
+  <rect class="layer" x="80" y="640" width="1440" height="170" rx="14"/>
+  <text class="layer-title" x="105" y="672">RPKI 领域层</text>
+  <rect class="domain" x="120" y="700" width="320" height="78" rx="10"/><text class="node-title" x="280" y="729" text-anchor="middle">CertificateAuthority</text><text class="node-text" x="280" y="752" text-anchor="middle">CA 生命周期、签发与发布编排</text>
+  <rect class="domain" x="475" y="700" width="250" height="78" rx="10"/><text class="node-title" x="600" y="729" text-anchor="middle">RoaRequest</text><text class="node-text" x="600" y="752" text-anchor="middle">ASN / Prefix / maxLength 校验</text>
+  <rect class="domain" x="760" y="700" width="300" height="78" rx="10"/><text class="node-title" x="910" y="729" text-anchor="middle">CertifiedResources</text><text class="node-text" x="910" y="752" text-anchor="middle">证书 IP 资源覆盖判断</text>
+  <rect class="domain" x="1095" y="700" width="300" height="78" rx="10"/><text class="node-title" x="1245" y="729" text-anchor="middle">ObjectIssuer</text><text class="node-text" x="1245" y="752" text-anchor="middle">ROA · CRL · Manifest 构造签名</text>
+
+  <rect class="layer" x="80" y="835" width="1440" height="105" rx="14"/>
+  <text class="layer-title" x="105" y="866">端口 → 当前本地适配器</text>
+  <rect class="infra" x="105" y="877" width="330" height="43" rx="8"/><text class="node-title" x="270" y="904" text-anchor="middle">SigningProvider → SoftwareSigner</text>
+  <rect class="store" x="465" y="877" width="330" height="43" rx="8"/><text class="node-title" x="630" y="904" text-anchor="middle">CaStateStore → LocalStateStore</text>
+  <rect class="infra" x="825" y="877" width="355" height="43" rx="8"/><text class="node-title" x="1002" y="904" text-anchor="middle">PublicationRepository → LocalRepository</text>
+  <rect class="store" x="1210" y="877" width="285" height="43" rx="8"/><text class="node-title" x="1352" y="896" text-anchor="middle">IdempotencyStore</text><text class="node-text" x="1352" y="914" text-anchor="middle">→ LocalIdempotencyStore</text>
+
+  <path class="edge" d="M282 274 V345 H400 V380"/><text class="edge-label" x="305" y="336">HTTPS</text>
+  <path class="edge" d="M797 274 V345 H1200 V380"/><text class="edge-label" x="970" y="336">命令行</text>
+  <path class="edge-dashed" d="M1312 274 V325"/><text class="edge-label" x="1325" y="314">启动</text>
+  <path class="edge" d="M400 448 V515 H730 V540"/><path class="edge" d="M1200 448 V515 H870 V540"/>
+  <path class="edge" d="M800 592 V665 H280 V700"/>
+  <path class="edge" d="M440 739 H475"/><path class="edge" d="M725 739 H760"/><path class="edge" d="M1060 739 H1095"/>
+  <path class="edge" d="M280 778 V825 H270 V877"/><path class="edge" d="M350 778 V815 H630 V877"/><path class="edge" d="M1245 778 V820 H1002 V877"/>
+  <path class="edge-dashed" d="M400 448 V485 H1352 V877"/><text class="edge-label" x="1170" y="480">API 幂等记录</text>
+
+  <circle cx="75" cy="1000" r="7" fill="#0284c7"/><text class="legend" x="90" y="1005">接口</text>
+  <circle cx="165" cy="1000" r="7" fill="#7c3aed"/><text class="legend" x="180" y="1005">应用服务</text>
+  <circle cx="285" cy="1000" r="7" fill="#16a34a"/><text class="legend" x="300" y="1005">领域组件</text>
+  <circle cx="405" cy="1000" r="7" fill="#ea580c"/><text class="legend" x="420" y="1005">基础设施</text>
+  <circle cx="525" cy="1000" r="7" fill="#d97706"/><text class="legend" x="540" y="1005">持久化数据</text>
+</svg>

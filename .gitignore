@@ -1,0 +1,6 @@
+/target/
+/data/
+*.roa
+*.key
+.idea/
+

@@ -1,0 +1,7 @@
+{
+  "asn": 64496,
+  "prefixes": [
+    { "prefix": "192.0.2.0/24", "max_length": 24 },
+    { "prefix": "2001:db8::/48", "max_length": 48 }
+  ]
+}
