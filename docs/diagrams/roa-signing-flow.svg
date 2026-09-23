@@ -37,6 +37,6 @@
   <path class="edge" d="M995 577 H1040 V309 H1080"/><path class="edge" d="M1182 353 V445"/><path class="edge" d="M1285 501 H1325 V393 H1365"/>
 
   <rect x="395" y="720" width="890" height="120" rx="12" fill="#fff1f2" stroke="#fca5a5" stroke-width="2"/>
-  <text class="failure-text" x="430" y="754">任一校验或签名步骤失败</text><text class="node-text" x="430" y="782">返回结构化错误；不发布半成品。状态在仓库切换前持久化，允许烧掉序列号，但绝不复用序列号。</text><text class="node-text" x="430" y="811">同一 Idempotency-Key 的成功请求直接返回原对象；同 key 不同请求被拒绝。</text>
+  <text class="failure-text" x="430" y="754">任一校验或签名步骤失败</text><text class="node-text" x="430" y="782">返回结构化错误；不发布半成品。状态在仓库切换前持久化，允许烧掉序列号，但绝不复用序列号。</text><text class="node-text" x="430" y="811">重复提交相同规范化领域状态时返回 unchanged，不重新签发。</text>
   <path class="failure" d="M522 629 V680 H840 V720"/>
 </svg>

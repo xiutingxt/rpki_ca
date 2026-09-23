@@ -68,6 +68,7 @@ pub(crate) struct ObjectSigningRequest<'a> {
 pub(crate) struct SignedObjectOutput {
     pub name: String,
     pub bytes: Vec<u8>,
+    pub advisories: Vec<String>,
 }
 
 pub(crate) struct CrlSigningRequest {
@@ -314,6 +315,12 @@ impl SigningProvider for SoftwareSigner {
             }
             ObjectDefinition::Aspa(definition) => {
                 issuer.issue_aspa(definition, request.serial, request.validity)
+            }
+            ObjectDefinition::Sispi(definition) => {
+                issuer.issue_sispi(definition, request.serial, request.validity)
+            }
+            ObjectDefinition::Toa(definition) => {
+                issuer.issue_toa(definition, request.serial, request.validity)
             }
         }
     }

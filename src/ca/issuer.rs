@@ -1,5 +1,5 @@
 use crate::{
-    AspaRequest, RoaRequest,
+    AspaRequest, RoaRequest, SispiRequest, ToaRequest,
     ca::publication,
     infrastructure::signing::{SignedObjectOutput, SoftwareSigner},
 };
@@ -65,7 +65,11 @@ impl<'a> ObjectIssuer<'a> {
                 signer: &signer,
             },
         )?;
-        Ok(SignedObjectOutput { name, bytes })
+        Ok(SignedObjectOutput {
+            name,
+            bytes,
+            advisories: Vec::new(),
+        })
     }
 
     pub fn issue_aspa(
@@ -91,7 +95,71 @@ impl<'a> ObjectIssuer<'a> {
                 signer: &signer,
             },
         )?;
-        Ok(SignedObjectOutput { name, bytes })
+        Ok(SignedObjectOutput {
+            name,
+            bytes,
+            advisories: Vec::new(),
+        })
+    }
+
+    pub fn issue_toa(
+        &self,
+        request: &ToaRequest,
+        serial: u64,
+        validity: Validity,
+    ) -> Result<SignedObjectOutput> {
+        let signer = self.signer.prepare_one_off().map_err(anyhow::Error::msg)?;
+        let name = format!(
+            "{}.toa",
+            publication::key_basename(signer.one_off_public_key())
+        );
+        let bytes = super::signed_objects::toa::issuer::issue(
+            request,
+            super::signed_objects::Params {
+                name: &name,
+                serial,
+                validity,
+                repository_uri: &self.repository_uri,
+                certificate_uri: &self.certificate_uri,
+                crl_uri: &self.crl_uri,
+                signer: &signer,
+            },
+        )?;
+        Ok(SignedObjectOutput {
+            name,
+            bytes,
+            advisories: Vec::new(),
+        })
+    }
+
+    pub fn issue_sispi(
+        &self,
+        request: &SispiRequest,
+        serial: u64,
+        validity: Validity,
+    ) -> Result<SignedObjectOutput> {
+        let signer = self.signer.prepare_one_off().map_err(anyhow::Error::msg)?;
+        let name = format!(
+            "{}.sav",
+            publication::key_basename(signer.one_off_public_key())
+        );
+        let bytes = super::signed_objects::sispi::issuer::issue(
+            request,
+            super::signed_objects::Params {
+                name: &name,
+                serial,
+                validity,
+                repository_uri: &self.repository_uri,
+                certificate_uri: &self.certificate_uri,
+                crl_uri: &self.crl_uri,
+                signer: &signer,
+            },
+        )?;
+        Ok(SignedObjectOutput {
+            name,
+            bytes,
+            advisories: Vec::new(),
+        })
     }
 
     pub fn issue_crl(

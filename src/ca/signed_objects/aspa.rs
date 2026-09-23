@@ -1,10 +1,7 @@
 use super::Params;
 use crate::AspaRequest;
 use anyhow::{Context, Result};
-use rpki::repository::{
-    aspa::{Aspa, AspaBuilder},
-    sigobj::SignedObjectBuilder,
-};
+use rpki::repository::aspa::{Aspa, AspaBuilder};
 
 pub(crate) fn issue(request: &AspaRequest, params: Params<'_>) -> Result<Vec<u8>> {
     let providers = request
@@ -13,13 +10,7 @@ pub(crate) fn issue(request: &AspaRequest, params: Params<'_>) -> Result<Vec<u8>
         .map(Into::into)
         .collect::<Vec<_>>();
     let builder = AspaBuilder::new(request.customer_asn.into(), providers)?;
-    let signed = SignedObjectBuilder::new(
-        params.serial.into(),
-        params.validity,
-        params.crl_uri.clone(),
-        params.certificate_uri.clone(),
-        params.repository_uri.join(params.name.as_bytes())?,
-    );
+    let signed = params.signed_object_builder()?;
     let object = builder
         .finalize(signed, params.signer, params.signer.primary_key_id())
         .map_err(|e| anyhow::anyhow!("ASPA signing failed: {e}"))?;

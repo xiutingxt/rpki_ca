@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub struct IssuanceTimingConfig {
     pub roa_valid_weeks: u32,
     pub aspa_valid_weeks: u32,
+    pub sispi_valid_weeks: u32,
+    pub toa_valid_weeks: u32,
+    /// Operator-selected interval for the draft's periodic TOA review.
+    pub toa_review_days: u32,
     pub publish_next_hours: u32,
     pub publish_next_jitter_hours: u32,
     pub publish_hours_before_next: u32,
@@ -16,6 +20,9 @@ impl Default for IssuanceTimingConfig {
         Self {
             roa_valid_weeks: 52,
             aspa_valid_weeks: 52,
+            sispi_valid_weeks: 52,
+            toa_valid_weeks: 52,
+            toa_review_days: 90,
             publish_next_hours: 24,
             publish_next_jitter_hours: 4,
             publish_hours_before_next: 8,
@@ -30,6 +37,12 @@ impl IssuanceTimingConfig {
             self.aspa_valid_weeks > 0,
             "aspa_valid_weeks must be positive"
         );
+        anyhow::ensure!(
+            self.sispi_valid_weeks > 0,
+            "sispi_valid_weeks must be positive"
+        );
+        anyhow::ensure!(self.toa_valid_weeks > 0, "toa_valid_weeks must be positive");
+        anyhow::ensure!(self.toa_review_days > 0, "toa_review_days must be positive");
         anyhow::ensure!(
             self.publish_next_hours >= 2,
             "publish_next_hours must be at least 2"

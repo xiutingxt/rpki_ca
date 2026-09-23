@@ -10,6 +10,9 @@ initialize_ca() {
         --ca-renew-before-days "${CA_RENEW_BEFORE_DAYS}" \
         --roa-valid-weeks "${ROA_VALID_WEEKS}" \
         --aspa-valid-weeks "${ASPA_VALID_WEEKS}" \
+        --sispi-valid-weeks "${SISPI_VALID_WEEKS}" \
+        --toa-valid-weeks "${TOA_VALID_WEEKS}" \
+        --toa-review-days "${TOA_REVIEW_DAYS}" \
         --publish-next-hours "${PUBLISH_NEXT_HOURS}" \
         --publish-next-jitter-hours "${PUBLISH_NEXT_JITTER_HOURS}" \
         --publish-hours-before-next "${PUBLISH_HOURS_BEFORE_NEXT}"

@@ -3,34 +3,34 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: rpki-ca:local
+    image: ${RPKI_CA_IMAGE_NAME:-rpki-ca}:${RPKI_CA_IMAGE_VERSION:-0.1.0}
     environment:
-      CA_DIR: /data
+      CA_DIR: /var/lib/rpki/ca
       REPOSITORY_URI: ${REPOSITORY_URI:-rsync://localhost/rpki/}
       CA_NAME: ${CA_NAME:-development-ca}
       DEVELOPMENT_CA_VALIDITY_DAYS: ${DEVELOPMENT_CA_VALIDITY_DAYS:-365}
       CA_RENEW_BEFORE_DAYS: ${CA_RENEW_BEFORE_DAYS:-30}
       ROA_VALID_WEEKS: ${ROA_VALID_WEEKS:-52}
       ASPA_VALID_WEEKS: ${ASPA_VALID_WEEKS:-52}
+      SISPI_VALID_WEEKS: ${SISPI_VALID_WEEKS:-52}
+      TOA_VALID_WEEKS: ${TOA_VALID_WEEKS:-52}
+      TOA_REVIEW_DAYS: ${TOA_REVIEW_DAYS:-90}
       PUBLISH_NEXT_HOURS: ${PUBLISH_NEXT_HOURS:-24}
       PUBLISH_NEXT_JITTER_HOURS: ${PUBLISH_NEXT_JITTER_HOURS:-4}
       PUBLISH_HOURS_BEFORE_NEXT: ${PUBLISH_HOURS_BEFORE_NEXT:-8}
       CA_RESOURCES: ${CA_RESOURCES:-192.0.2.0/24 2001:db8::/48}
-      CA_AS_RESOURCES: ${CA_AS_RESOURCES:-}
+      CA_AS_RESOURCES: ${CA_AS_RESOURCES:-64496}
       API_BIND: 0.0.0.0:3000
       API_TOKEN: ${API_TOKEN:?set API_TOKEN in docker/.env}
       CORS_ORIGIN: ${CORS_ORIGIN:-}
     volumes:
-      - rpki-ca-data:/data
+      - ${CA_DATA_DIR:-../data/docker}:/var/lib/rpki
     ports:
       - "127.0.0.1:${API_PORT:-3000}:3000"
     healthcheck:
-      test: ["CMD-SHELL", "test -f /data/ca.toml && find /data/repository -maxdepth 1 -name '*.cer' | grep -q . && find /data/repository -maxdepth 1 -name '*.crl' | grep -q . && find /data/repository -maxdepth 1 -name '*.mft' | grep -q . && test -n \"$${API_TOKEN}\""]
+      test: ["CMD-SHELL", "test -f /var/lib/rpki/ca/ca.toml && find /var/lib/rpki/ca/repository -maxdepth 1 -name '*.cer' | grep -q . && find /var/lib/rpki/ca/repository -maxdepth 1 -name '*.crl' | grep -q . && find /var/lib/rpki/ca/repository -maxdepth 1 -name '*.mft' | grep -q . && test -n \"$${API_TOKEN}\""]
       interval: 5s
       timeout: 3s
       retries: 20
       start_period: 30s
     restart: unless-stopped
-
-volumes:
-  rpki-ca-data:

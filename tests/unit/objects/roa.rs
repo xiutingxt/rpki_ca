@@ -37,3 +37,21 @@ fn produces_rfc_9582_canonical_order() {
     assert_eq!(values[0].prefix.to_string(), "192.0.2.0/24");
     assert_eq!(values[0].max_length, None);
 }
+
+#[test]
+fn configuration_identity_ignores_comment_and_default_max_length_encoding() {
+    let first = RoaConfiguration {
+        asn: 64496,
+        prefix: "192.0.2.0/24".parse().unwrap(),
+        max_length: None,
+        comment: Some("first".into()),
+    };
+    let second = RoaConfiguration {
+        asn: 64496,
+        prefix: "192.0.2.0/24".parse().unwrap(),
+        max_length: Some(24),
+        comment: Some("second".into()),
+    };
+    assert_eq!(first.key(), second.key());
+    assert_eq!(second.canonicalized().max_length, None);
+}

@@ -17,7 +17,7 @@
   <rect class="layer" x="80" y="155" width="1440" height="145" rx="14"/>
   <text class="layer-title" x="105" y="187">使用者与入口</text>
   <rect class="entry" x="150" y="210" width="265" height="64" rx="10"/>
-  <text class="node-title" x="282" y="238" text-anchor="middle">前端 / API Client</text><text class="node-text" x="282" y="260" text-anchor="middle">JSON · Bearer Token · Idempotency-Key</text>
+  <text class="node-title" x="282" y="238" text-anchor="middle">前端 / API Client</text><text class="node-text" x="282" y="260" text-anchor="middle">JSON · Bearer Token</text>
   <rect class="entry" x="665" y="210" width="265" height="64" rx="10"/>
   <text class="node-title" x="797" y="238" text-anchor="middle">运维人员 / Scheduler</text><text class="node-text" x="797" y="260" text-anchor="middle">init · import · sign-roa · refresh</text>
   <rect class="entry" x="1180" y="210" width="265" height="64" rx="10"/>
@@ -47,7 +47,7 @@
   <rect class="infra" x="105" y="877" width="330" height="43" rx="8"/><text class="node-title" x="270" y="904" text-anchor="middle">SigningProvider → SoftwareSigner</text>
   <rect class="store" x="465" y="877" width="330" height="43" rx="8"/><text class="node-title" x="630" y="904" text-anchor="middle">CaStateStore → LocalStateStore</text>
   <rect class="infra" x="825" y="877" width="355" height="43" rx="8"/><text class="node-title" x="1002" y="904" text-anchor="middle">PublicationRepository → LocalRepository</text>
-  <rect class="store" x="1210" y="877" width="285" height="43" rx="8"/><text class="node-title" x="1352" y="896" text-anchor="middle">IdempotencyStore</text><text class="node-text" x="1352" y="914" text-anchor="middle">→ LocalIdempotencyStore</text>
+  <rect class="store" x="1210" y="877" width="285" height="43" rx="8"/><text class="node-title" x="1352" y="896" text-anchor="middle">Object Inventory</text><text class="node-text" x="1352" y="914" text-anchor="middle">规范化领域状态去重</text>
 
   <path class="edge" d="M282 274 V345 H400 V380"/><text class="edge-label" x="305" y="336">HTTPS</text>
   <path class="edge" d="M797 274 V345 H1200 V380"/><text class="edge-label" x="970" y="336">命令行</text>

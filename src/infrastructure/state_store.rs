@@ -53,7 +53,10 @@ impl CaStateStore for LocalStateStore {
             .truncate(false)
             .open(&path)
             .context("cannot open CA state lock")?;
-        file.try_lock().context("CA is busy")?;
+        // Concurrent API reads and writes must be serialized rather than
+        // failing nondeterministically. In particular, the web UI loads
+        // several state-backed views in parallel when a page opens.
+        file.lock().context("cannot lock CA state")?;
         Ok(Box::new(LocalStateGuard { _file: file }))
     }
 }
@@ -113,3 +116,7 @@ fn sync_parent(path: &Path) -> Result<()> {
 fn sync_parent(_: &Path) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/infrastructure/state_store.rs"]
+mod tests;

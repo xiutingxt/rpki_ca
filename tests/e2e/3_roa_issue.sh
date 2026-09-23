@@ -6,12 +6,12 @@ prepare_environment
 REQUEST="$(roa_request_json)"
 log "ROA input: Origin AS${E2E_ROA_ASN}; Prefixes: ${E2E_ROA_PREFIXES[*]}"
 RESPONSE="$(curl --silent --show-error --fail --request POST "${BASE_URL}/api/v1/roas" \
-  --header "Authorization: Bearer ${API_TOKEN}" --header "Idempotency-Key: ${IDEMPOTENCY_KEY}" \
+  --header "Authorization: Bearer ${API_TOKEN}" \
   --header 'Content-Type: application/json' --data "${REQUEST}")"
 log "API response: ${RESPONSE}"
-OBJECT_NAME="$(printf '%s' "${RESPONSE}" | sed -n 's/.*"object_name":"\([^"]*\)".*/\1/p')"
+OBJECT_NAME="$(printf '%s' "${RESPONSE}" | sed -n 's/.*"roa_objects":\["\([^"]*\)"\].*/\1/p')"
 [[ "${OBJECT_NAME}" =~ ^[A-Za-z0-9_-]{27}\.roa$ ]] || { log "ERROR: object_name is not the RFC 6481 key-derived ROA name"; exit 1; }
-printf '%s' "${RESPONSE}" | grep -q '"created":true' || { log "ERROR: ROA was not newly created"; exit 1; }
+printf '%s' "${RESPONSE}" | grep -q '"added":\[' || { log "ERROR: ROA authorization delta was not applied"; exit 1; }
 printf '%s' "${OBJECT_NAME}" >"${STATE_DIR}/roa-object-name"
 DOWNLOAD_DIR="${STATE_DIR}/downloads"; mkdir -p "${DOWNLOAD_DIR}"
 CERT_NAME="$(publication_name cer)"

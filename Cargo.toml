@@ -2,13 +2,15 @@
 name = "rpki-ca"
 version = "0.1.0"
 edition = "2024"
-description = "A minimal, extensible RPKI CA capable of issuing ROAs and ASPAs"
+description = "A minimal, extensible RPKI CA for issuing ROAs, ASPAs, and experimental signed objects"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
+bcder = "0.7"
+bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 ipnet = { version = "2", features = ["serde"] }
@@ -21,6 +23,5 @@ signature = "2"
 toml = "0.9"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors"] }
-
-[dev-dependencies]
 tempfile = "3"
+x509-parser = "0.18"

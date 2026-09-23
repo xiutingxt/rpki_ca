@@ -1,8 +1,77 @@
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rpki::repository::{
-    cert::Cert, crl::Crl, manifest::Manifest, resources::ResourceSet, tal::TalInfo, x509::Time,
+    cert::{Cert, ResourceCert},
+    crl::Crl,
+    manifest::Manifest,
+    tal::{Tal, TalInfo},
+    x509::Time,
 };
-use std::{collections::BTreeSet, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeSet, io::Cursor};
+
+/// Durable material needed to validate the current CA certificate back to its
+/// configured trust anchor.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub(crate) enum ParentValidationContext {
+    DevelopmentTrustAnchor,
+    Imported {
+        tal_base64: String,
+        chain_base64: Vec<String>,
+        crls_base64: Vec<String>,
+        manifests_base64: Vec<String>,
+    },
+}
+
+impl ParentValidationContext {
+    pub fn imported(
+        chain: &[Vec<u8>],
+        crls: &[Vec<u8>],
+        manifests: &[Vec<u8>],
+        tal: &[u8],
+    ) -> Self {
+        Self::Imported {
+            tal_base64: STANDARD.encode(tal),
+            chain_base64: encode_all(chain),
+            crls_base64: encode_all(crls),
+            manifests_base64: encode_all(manifests),
+        }
+    }
+
+    pub fn validate(&self, cert: &Cert) -> Result<ResourceCert> {
+        match self {
+            Self::DevelopmentTrustAnchor => {
+                if !cert.is_self_signed() {
+                    bail!(
+                        "development trust-anchor context contains a non-self-signed CA certificate"
+                    );
+                }
+                cert.clone()
+                    .validate_ta(TalInfo::from_name("development-ta".into()).into_arc(), true)
+                    .map_err(|error| {
+                        anyhow::anyhow!("development trust anchor validation failed: {error}")
+                    })
+            }
+            Self::Imported {
+                tal_base64,
+                chain_base64,
+                crls_base64,
+                manifests_base64,
+            } => {
+                let tal = decode_one("TAL", tal_base64)?;
+                let chain = decode_all("certificate chain", chain_base64)?;
+                let crls = decode_all("issuer CRLs", crls_base64)?;
+                let manifests = decode_all("issuer manifests", manifests_base64)?;
+                validate_import_path(cert, &chain, &crls, &manifests, &tal)
+            }
+        }
+    }
+
+    pub const fn is_imported(&self) -> bool {
+        matches!(self, Self::Imported { .. })
+    }
+}
 
 /// Validates an imported certificate from the trust anchor through every
 /// issuing CA and checks the current CRL for each hop.
@@ -11,20 +80,24 @@ pub(crate) fn validate_import_path(
     chain: &[Vec<u8>],
     crls: &[Vec<u8>],
     manifests: &[Vec<u8>],
-) -> Result<ResourceSet> {
+    tal_bytes: &[u8],
+) -> Result<ResourceCert> {
+    let tal = Tal::read_named("configured-ta".into(), &mut Cursor::new(tal_bytes))
+        .map_err(|error| anyhow::anyhow!("invalid trust anchor locator: {error}"))?;
     if cert.is_self_signed() {
         if !chain.is_empty() || !crls.is_empty() || !manifests.is_empty() {
-            bail!("a trust anchor import must not include a parent chain or issuer CRLs");
+            bail!(
+                "a trust anchor import must not include a parent chain, issuer CRLs, or issuer manifests"
+            );
+        }
+        if cert.subject_public_key_info() != tal.key_info() {
+            bail!("trust anchor certificate public key does not match the TAL");
         }
         let validated = cert
             .clone()
-            .validate_ta(Arc::new(TalInfo::from_name("imported-ta".into())), true)
+            .validate_ta(tal.info().clone(), true)
             .map_err(|err| anyhow::anyhow!("trust anchor validation failed: {err}"))?;
-        return Ok(ResourceSet::new(
-            validated.as_resources().clone(),
-            validated.v4_resources().clone().into(),
-            validated.v6_resources().clone().into(),
-        ));
+        return Ok(validated);
     }
     if chain.is_empty() {
         bail!("a non-self-signed RC requires --chain-certificate entries from TA to parent");
@@ -36,9 +109,12 @@ pub(crate) fn validate_import_path(
         bail!("one --chain-manifest is required for every issuing CA in the chain");
     }
 
-    let ta = Cert::decode(chain[0].as_slice())
-        .context("invalid trust anchor certificate")?
-        .validate_ta(Arc::new(TalInfo::from_name("import-chain".into())), true)
+    let ta_cert = Cert::decode(chain[0].as_slice()).context("invalid trust anchor certificate")?;
+    if ta_cert.subject_public_key_info() != tal.key_info() {
+        bail!("trust anchor certificate public key does not match the TAL");
+    }
+    let ta = ta_cert
+        .validate_ta(tal.info().clone(), true)
         .map_err(|err| anyhow::anyhow!("trust anchor validation failed: {err}"))?;
     let mut issuer = ta;
     for (index, ((crl_bytes, manifest_bytes), _)) in
@@ -68,11 +144,6 @@ pub(crate) fn validate_import_path(
             .map_err(|err| anyhow::anyhow!("issuer manifest validation failed: {err}"))?;
         if manifest_content.this_update() > now || manifest_content.next_update() < now {
             bail!("issuer manifest is not currently valid");
-        }
-        if manifest_content.this_update() != crl.this_update()
-            || manifest_content.next_update() != crl.next_update()
-        {
-            bail!("issuer manifest and CRL update times do not match");
         }
         if crl.contains(manifest_ee_serial) {
             bail!("issuer manifest EE certificate is revoked");
@@ -144,9 +215,27 @@ pub(crate) fn validate_import_path(
             .validate_ca(&issuer, true)
             .map_err(|err| anyhow::anyhow!("resource certificate path validation failed: {err}"))?;
     }
-    Ok(ResourceSet::new(
-        issuer.as_resources().clone(),
-        issuer.v4_resources().clone().into(),
-        issuer.v6_resources().clone().into(),
-    ))
+    Ok(issuer)
+}
+
+fn encode_all(values: &[Vec<u8>]) -> Vec<String> {
+    values.iter().map(|value| STANDARD.encode(value)).collect()
+}
+
+fn decode_all(label: &str, values: &[String]) -> Result<Vec<Vec<u8>>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            STANDARD
+                .decode(value)
+                .with_context(|| format!("invalid persisted {label} item {}", index + 1))
+        })
+        .collect()
+}
+
+fn decode_one(label: &str, value: &str) -> Result<Vec<u8>> {
+    STANDARD
+        .decode(value)
+        .with_context(|| format!("invalid persisted {label}"))
 }

@@ -1,12 +1,20 @@
-//! Validation of ROA and ASPA publication sets.
+//! Object-specific validation layered on the common publication-set checks.
 
-use crate::ca::publication;
-use anyhow::{Context, Result, ensure};
-use rpki::{
-    crypto::digest::DigestAlgorithm,
-    repository::{aspa::Aspa, cert::Cert, crl::Crl, manifest::Manifest, roa::Roa, tal::TalInfo},
+use super::publication_set::PublicationSet;
+use crate::ca::signed_objects::{sispi::object::Sispi, toa::object::Toa};
+use crate::ca::state::CaStateStore;
+use crate::infrastructure::{repository::LocalRepository, state_store::LocalStateStore};
+use anyhow::{Result, ensure};
+use rpki::repository::{
+    aspa::Aspa,
+    resources::{Asn, Prefix},
+    roa::Roa,
 };
-use std::{collections::BTreeSet, fs, path::Path};
+use std::net::IpAddr;
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+};
 
 pub fn verify_roa_publication(
     ca_dir: &Path,
@@ -14,48 +22,17 @@ pub fn verify_roa_publication(
     expected_asn: u32,
     expected_payloads: &[String],
 ) -> Result<Vec<String>> {
-    ensure!(
-        roa_name.ends_with(".roa") && !roa_name.contains(['/', '\\']),
-        "invalid ROA object name"
-    );
-    let repository = ca_dir.join("repository");
-    let ca_name = find_one(&repository, "cer")?;
-    let crl_name = find_one(&repository, "crl")?;
-    let manifest_name = find_one(&repository, "mft")?;
-    let ca_bytes = read(&repository, &ca_name)?;
-    let crl_bytes = read(&repository, &crl_name)?;
-    let roa_bytes = read(&repository, roa_name)?;
-    let manifest_bytes = read(&repository, &manifest_name)?;
-
-    let ca = Cert::decode(ca_bytes.as_slice())?
-        .validate_ta(
-            TalInfo::from_name("local-verification".into()).into_arc(),
-            true,
-        )
-        .map_err(|err| anyhow::anyhow!("CA certificate validation failed: {err}"))?;
-    ensure_recommended_name(&ca_name, &ca.subject_key_identifier(), "cer")?;
-    ensure_recommended_name(&crl_name, &ca.subject_key_identifier(), "crl")?;
-    ensure_recommended_name(&manifest_name, &ca.subject_key_identifier(), "mft")?;
-    let mut report = vec!["CA certificate: valid resource trust anchor".to_owned()];
-
-    let crl = Crl::decode(crl_bytes.as_slice())?;
-    crl.verify_signature(ca.subject_public_key_info())
-        .map_err(|err| anyhow::anyhow!("CRL signature validation failed: {err}"))?;
-    ensure!(
-        crl.this_update() < crl.next_update(),
-        "invalid CRL update window"
-    );
-    report.push("CRL: signature and update window valid".to_owned());
-
-    let roa = Roa::decode(roa_bytes.as_slice(), true)?;
-    ensure_recommended_name(roa_name, &roa.cert().subject_key_identifier(), "roa")?;
-    ensure!(
-        !crl.contains(roa.cert().serial_number()),
-        "ROA EE certificate is revoked"
-    );
+    validate_name(roa_name, "roa")?;
+    let repository = LocalRepository::new(ca_dir);
+    let state = LocalStateStore::new(ca_dir).load()?;
+    let publication = PublicationSet::load(&repository, state.validation_context())?;
+    let path = ca_dir.join("repository").join(roa_name);
+    let roa = Roa::decode(std::fs::read(&path)?.as_slice(), true)?;
+    let bytes = publication.validate_object(roa_name, roa.cert(), "roa")?;
+    let roa = Roa::decode(bytes.as_slice(), true)?;
     let (_, content) = roa
-        .process(&ca, true, |_| Ok(()))
-        .map_err(|err| anyhow::anyhow!("ROA validation failed: {err}"))?;
+        .process(&publication.ca, true, |_| Ok(()))
+        .map_err(|error| anyhow::anyhow!("ROA validation failed: {error}"))?;
     ensure!(
         u32::from(content.as_id()) == expected_asn,
         "origin ASN mismatch"
@@ -76,50 +53,11 @@ pub fn verify_roa_publication(
         actual == expected,
         "ROA payload mismatch: expected {expected:?}, got {actual:?}"
     );
-    report.push(format!(
-        "ROA: CMS, EE certificate, ASN {expected_asn}, and payloads valid"
-    ));
-
-    let manifest = Manifest::decode(manifest_bytes.as_slice(), true)?;
-    ensure!(
-        !crl.contains(manifest.cert().serial_number()),
-        "Manifest EE certificate is revoked"
-    );
-    ensure!(
-        manifest.cert().validity().not_before() == manifest.content().this_update()
-            && manifest.cert().validity().not_after() == manifest.content().next_update(),
-        "Manifest EE validity does not equal its update window"
-    );
-    let (_, content) = manifest
-        .validate(&ca, true)
-        .map_err(|err| anyhow::anyhow!("Manifest validation failed: {err}"))?;
-    ensure!(
-        content.file_hash_alg() == DigestAlgorithm::sha256(),
-        "Manifest is not SHA-256"
-    );
-    let mut listed = BTreeSet::new();
-    for entry in content.iter() {
-        let name = std::str::from_utf8(entry.file())?.to_owned();
-        let bytes = read(&repository, &name)?;
-        ensure!(
-            content.file_hash_alg().digest(&bytes).as_ref() == entry.hash().as_ref(),
-            "Manifest hash mismatch for {name}"
-        );
-        listed.insert(name);
-    }
-    ensure!(
-        listed.contains(&crl_name),
-        "Manifest does not list {crl_name}"
-    );
-    ensure!(
-        listed.contains(roa_name),
-        "Manifest does not list {roa_name}"
-    );
-    report.push(format!(
-        "Manifest: CMS, EE certificate, SHA-256, and {} file hashes valid",
-        listed.len()
-    ));
-    Ok(report)
+    Ok(vec![
+        "CA certificate, current CRL, and current Manifest valid".into(),
+        format!("ROA: CMS, EE certificate, ASN {expected_asn}, and payloads valid"),
+        "Manifest: complete file hashes and selected CRL valid".into(),
+    ])
 }
 
 pub fn verify_aspa_publication(
@@ -128,35 +66,17 @@ pub fn verify_aspa_publication(
     customer_asn: u32,
     expected_providers: &[u32],
 ) -> Result<Vec<String>> {
-    ensure!(
-        aspa_name.ends_with(".asa") && !aspa_name.contains(['/', '\\']),
-        "invalid ASPA object name"
-    );
-    let repository = ca_dir.join("repository");
-    let ca_name = find_one(&repository, "cer")?;
-    let crl_name = find_one(&repository, "crl")?;
-    let manifest_name = find_one(&repository, "mft")?;
-    let ca = Cert::decode(read(&repository, &ca_name)?.as_slice())?
-        .validate_ta(
-            TalInfo::from_name("local-verification".into()).into_arc(),
-            true,
-        )
-        .map_err(|err| anyhow::anyhow!("CA certificate validation failed: {err}"))?;
-    ensure_recommended_name(&ca_name, &ca.subject_key_identifier(), "cer")?;
-    ensure_recommended_name(&crl_name, &ca.subject_key_identifier(), "crl")?;
-    ensure_recommended_name(&manifest_name, &ca.subject_key_identifier(), "mft")?;
-    let crl = Crl::decode(read(&repository, &crl_name)?.as_slice())?;
-    crl.verify_signature(ca.subject_public_key_info())
-        .map_err(|err| anyhow::anyhow!("CRL signature validation failed: {err}"))?;
-    let aspa = Aspa::decode(read(&repository, aspa_name)?.as_slice(), true)?;
-    ensure_recommended_name(aspa_name, &aspa.cert().subject_key_identifier(), "asa")?;
-    ensure!(
-        !crl.contains(aspa.cert().serial_number()),
-        "ASPA EE certificate is revoked"
-    );
+    validate_name(aspa_name, "asa")?;
+    let repository = LocalRepository::new(ca_dir);
+    let state = LocalStateStore::new(ca_dir).load()?;
+    let publication = PublicationSet::load(&repository, state.validation_context())?;
+    let path = ca_dir.join("repository").join(aspa_name);
+    let aspa = Aspa::decode(std::fs::read(&path)?.as_slice(), true)?;
+    let bytes = publication.validate_object(aspa_name, aspa.cert(), "asa")?;
+    let aspa = Aspa::decode(bytes.as_slice(), true)?;
     let (_, content) = aspa
-        .process(&ca, true, |_| Ok(()))
-        .map_err(|err| anyhow::anyhow!("ASPA validation failed: {err}"))?;
+        .process(&publication.ca, true, |_| Ok(()))
+        .map_err(|error| anyhow::anyhow!("ASPA validation failed: {error}"))?;
     ensure!(
         u32::from(content.customer_as()) == customer_asn,
         "customer ASN mismatch"
@@ -171,56 +91,128 @@ pub fn verify_aspa_publication(
         actual == expected,
         "provider ASN mismatch: expected {expected:?}, got {actual:?}"
     );
-
-    let manifest = Manifest::decode(read(&repository, &manifest_name)?.as_slice(), true)?;
-    let (_, manifest) = manifest
-        .validate(&ca, true)
-        .map_err(|err| anyhow::anyhow!("Manifest validation failed: {err}"))?;
-    let entry = manifest
-        .iter()
-        .find(|entry| entry.file().as_ref() == aspa_name.as_bytes())
-        .context("Manifest does not list ASPA")?;
-    let bytes = read(&repository, aspa_name)?;
-    ensure!(
-        manifest.file_hash_alg().digest(&bytes).as_ref() == entry.hash().as_ref(),
-        "Manifest hash mismatch for {aspa_name}"
-    );
     Ok(vec![
-        "CA certificate and CRL valid".to_owned(),
+        "CA certificate, current CRL, and current Manifest valid".into(),
         format!("ASPA: CMS, EE certificate, customer AS{customer_asn}, and providers valid"),
-        "Manifest: ASPA entry and SHA-256 hash valid".to_owned(),
+        "Manifest: complete file hashes and selected CRL valid".into(),
     ])
 }
 
-fn read(repository: &Path, name: &str) -> Result<Vec<u8>> {
-    fs::read(repository.join(name)).with_context(|| format!("cannot read repository object {name}"))
+pub fn verify_toa_publication(
+    ca_dir: &Path,
+    toa_name: &str,
+    expected_asns: &[u32],
+    expected_prefixes: &[ipnet::IpNet],
+) -> Result<Vec<String>> {
+    validate_name(toa_name, "toa")?;
+    let repository = LocalRepository::new(ca_dir);
+    let state = LocalStateStore::new(ca_dir).load()?;
+    let publication = PublicationSet::load(&repository, state.validation_context())?;
+    let path = ca_dir.join("repository").join(toa_name);
+    let toa = Toa::decode(std::fs::read(&path)?.into())?;
+    let bytes = publication.validate_object(toa_name, toa.cert(), "toa")?;
+    let toa = Toa::decode(bytes.into())?;
+    let (_, content) = toa
+        .process(&publication.ca, |_| Ok(()))
+        .map_err(|error| anyhow::anyhow!("TOA validation failed: {error}"))?;
+    ensure!(
+        content.asns().iter().copied().collect::<BTreeSet<_>>()
+            == expected_asns.iter().copied().map(Asn::from).collect(),
+        "TOA AS set mismatch"
+    );
+    let expected_v4 = expected_prefixes
+        .iter()
+        .filter(|prefix| prefix.addr().is_ipv4())
+        .map(|prefix| Prefix::new(prefix.addr(), prefix.prefix_len()))
+        .collect::<HashSet<_>>();
+    let expected_v6 = expected_prefixes
+        .iter()
+        .filter(|prefix| prefix.addr().is_ipv6())
+        .map(|prefix| Prefix::new(prefix.addr(), prefix.prefix_len()))
+        .collect::<HashSet<_>>();
+    ensure!(
+        content
+            .v4_prefixes()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            == expected_v4
+            && content
+                .v6_prefixes()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                == expected_v6,
+        "TOA prefix set mismatch"
+    );
+    Ok(vec![
+        "CA certificate, current CRL, and current Manifest valid".into(),
+        "TOA CMS, profile, EE resources, ASN set, and prefixes valid".into(),
+        "Manifest: complete file hashes and selected CRL valid".into(),
+    ])
 }
 
-fn ensure_recommended_name(
-    actual: &str,
-    key: &rpki::crypto::KeyIdentifier,
-    extension: &str,
-) -> Result<()> {
-    let expected = publication::key_filename(key, extension);
+pub fn verify_sispi_publication(
+    ca_dir: &Path,
+    sispi_name: &str,
+    expected_as_id: u32,
+    expected_addresses: &[IpAddr],
+) -> Result<Vec<String>> {
+    validate_name(sispi_name, "sav")?;
+    let repository = LocalRepository::new(ca_dir);
+    let state = LocalStateStore::new(ca_dir).load()?;
+    let publication = PublicationSet::load(&repository, state.validation_context())?;
+    let path = ca_dir.join("repository").join(sispi_name);
+    let sispi = Sispi::decode(std::fs::read(&path)?.into())?;
+    let bytes = publication.validate_object(sispi_name, sispi.cert(), "sav")?;
+    let sispi = Sispi::decode(bytes.into())?;
+    let (_, content) = sispi
+        .process(&publication.ca, |_| Ok(()))
+        .map_err(|error| anyhow::anyhow!("SiSPI validation failed: {error}"))?;
     ensure!(
-        actual == expected,
-        "object name {actual} is not the RFC 6481 recommended name {expected}"
+        content.as_id() == Asn::from(expected_as_id),
+        "SiSPI AS ID mismatch"
+    );
+    let expected_v4 = expected_addresses
+        .iter()
+        .filter_map(|address| match address {
+            IpAddr::V4(address) => Some(Prefix::new(*address, 32)),
+            IpAddr::V6(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    let expected_v6 = expected_addresses
+        .iter()
+        .filter_map(|address| match address {
+            IpAddr::V4(_) => None,
+            IpAddr::V6(address) => Some(Prefix::new(*address, 128)),
+        })
+        .collect::<HashSet<_>>();
+    ensure!(
+        content
+            .v4_addresses()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            == expected_v4
+            && content
+                .v6_addresses()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                == expected_v6,
+        "SiSPI address mismatch"
+    );
+    Ok(vec![
+        "CA certificate, current CRL, and current Manifest valid".into(),
+        format!("SiSPI CMS, profile, AS{expected_as_id}, and SAVNET Agent addresses valid"),
+        "Manifest: complete file hashes and selected CRL valid".into(),
+    ])
+}
+
+fn validate_name(name: &str, extension: &str) -> Result<()> {
+    ensure!(
+        name.ends_with(&format!(".{extension}")) && !name.contains(['/', '\\']),
+        "invalid signed-object name"
     );
     Ok(())
-}
-
-fn find_one(repository: &Path, extension: &str) -> Result<String> {
-    let suffix = format!(".{extension}");
-    let mut matches = fs::read_dir(repository)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.ends_with(&suffix));
-    let name = matches
-        .next()
-        .with_context(|| format!("repository contains no {suffix} object"))?;
-    ensure!(
-        matches.next().is_none(),
-        "repository contains multiple {suffix} objects"
-    );
-    Ok(name)
 }

@@ -1,22 +1,23 @@
 //! Axum server, routes, handlers, and HTTP DTOs.
 
+use super::repository::{RepositoryInspection, RepositoryList, inspect, summarize};
+use crate::application::signed_objects::{self, IssueAction};
 use crate::{
-    AspaRequest, CaCertificateRenewal, CaCertificateStatus, CaManager, ObjectDefinition,
-    ObjectKind, RoaRequest,
-    infrastructure::idempotency::{IdempotencyStore, LocalIdempotencyStore},
+    AspaDelta, CaCertificateRenewal, CaCertificateStatus, CaManager, CaValidationContextUpdate,
+    ObjectDefinition, ObjectDeltaResponse, ObjectKind, ObjectWithdrawal, RoaConfigurationView,
+    RoaDelta, RoaDeltaRejected, RoaDeltaResponse, SispiDelta, ToaRequest,
 };
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc};
 use tokio::time::{Duration, interval};
 use tokio::{net::TcpListener, sync::Semaphore};
@@ -25,37 +26,51 @@ use tower_http::cors::CorsLayer;
 #[derive(Clone)]
 struct ApiState {
     manager: Arc<CaManager>,
-    idempotency: Arc<dyn IdempotencyStore>,
     token: Arc<str>,
     writer: Arc<Semaphore>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct IdempotencyRecord {
-    request_hash: String,
-    definition: ObjectDefinition,
-    requested_name: String,
-    published_name: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 struct ObjectResponse {
-    id: String,
+    logical_key: String,
     object_name: String,
     download_url: String,
     created: bool,
+    updated: bool,
+    status: &'static str,
+    advisories: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CertificateRenewalRequest {
     certificate_base64: String,
+    tal_base64: String,
     #[serde(default)]
     chain_base64: Vec<String>,
     #[serde(default)]
     crls_base64: Vec<String>,
     #[serde(default)]
     manifests_base64: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationContextUpdateRequest {
+    tal_base64: String,
+    #[serde(default)]
+    chain_base64: Vec<String>,
+    #[serde(default)]
+    crls_base64: Vec<String>,
+    #[serde(default)]
+    manifests_base64: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToaReviewRequest {
+    #[serde(default)]
+    roa_overlap_justification: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +81,7 @@ struct ErrorResponse {
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+#[derive(Debug)]
 struct ApiError(StatusCode, &'static str, String);
 
 impl IntoResponse for ApiError {
@@ -90,7 +106,6 @@ pub async fn serve(
     let manager = Arc::new(CaManager::open(&root).context("cannot open CA for API server")?);
     let state = ApiState {
         manager,
-        idempotency: Arc::new(LocalIdempotencyStore::new(root)),
         token: token.into(),
         writer: Arc::new(Semaphore::new(1)),
     };
@@ -114,16 +129,56 @@ pub async fn serve(
                 Ok(_) => {}
                 Err(error) => eprintln!("CA certificate status check failed: {error:#}"),
             }
+            match refresh_manager.toa_review_statuses() {
+                Ok(statuses) => {
+                    for status in statuses.into_iter().filter(|status| status.overdue) {
+                        eprintln!(
+                            "TOA periodic review overdue for {}; due at Unix timestamp {}",
+                            status.object_name, status.review_due_at
+                        );
+                    }
+                }
+                Err(error) => eprintln!("TOA review status check failed: {error:#}"),
+            }
         }
     });
     let mut app = Router::new()
         .route("/healthz", get(health))
-        .route("/api/v1/roas", post(create_roa))
-        .route("/api/v1/roas/{id}", get(get_roa).delete(delete_roa))
-        .route("/api/v1/aspas", post(create_aspa))
-        .route("/api/v1/aspas/{id}", get(get_aspa).delete(delete_aspa))
+        .route("/api/v1/roas", get(list_roas).post(update_roas))
+        .route("/api/v1/aspas", get(list_aspas).post(create_aspa))
+        .route(
+            "/api/v1/aspas/{customer_asn}",
+            get(get_aspa).delete(withdraw_aspa),
+        )
+        .route("/api/v1/toas", get(list_toas).post(create_toa))
+        .route("/api/v1/toas/reviews", get(list_toa_reviews))
+        .route("/api/v1/toas/{key}", get(get_toa).delete(withdraw_toa))
+        .route("/api/v1/toas/{name}/reviews", post(review_toa))
+        .route("/api/v1/sispis", get(list_sispis).post(create_sispi))
+        .route(
+            "/api/v1/sispis/{as_id}",
+            get(get_sispi).delete(withdraw_sispi),
+        )
+        .route(
+            "/api/v1/signed-objects/{name}",
+            delete(withdraw_published_object),
+        )
         .route("/api/v1/ca/certificate", get(certificate_status))
+        .route("/api/v1/ca/resources", get(certified_resources))
         .route("/api/v1/ca/certificate-renewals", post(renew_certificate))
+        .route(
+            "/api/v1/ca/validation-context",
+            post(update_validation_context),
+        )
+        .route("/api/v1/repository/objects", get(list_repository_objects))
+        .route(
+            "/api/v1/repository/objects/{name}",
+            get(inspect_repository_object),
+        )
+        .route(
+            "/api/v1/repository/objects/{name}/validation",
+            get(validate_repository_object),
+        )
         .route("/repository/{name}", get(download_object))
         .with_state(state);
     if let Some(origin) = cors_origin {
@@ -132,11 +187,7 @@ pub async fn serve(
             CorsLayer::new()
                 .allow_origin(origin)
                 .allow_methods([Method::GET, Method::POST, Method::DELETE])
-                .allow_headers([
-                    header::AUTHORIZATION,
-                    header::CONTENT_TYPE,
-                    header::HeaderName::from_static("idempotency-key"),
-                ]),
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
         );
     }
     let listener = TcpListener::bind(bind)
@@ -164,6 +215,18 @@ async fn certificate_status(
         .map_err(internal)
 }
 
+async fn certified_resources(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<crate::CertifiedResourcesView>> {
+    authorize(&state, &headers)?;
+    state
+        .manager
+        .certified_resources()
+        .map(Json)
+        .map_err(internal)
+}
+
 async fn renew_certificate(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -175,6 +238,7 @@ async fn renew_certificate(
         chain: decode_base64_list(&request.chain_base64)?,
         crls: decode_base64_list(&request.crls_base64)?,
         manifests: decode_base64_list(&request.manifests_base64)?,
+        tal: decode_base64(&request.tal_base64)?,
     };
     let _permit = state.writer.acquire().await.map_err(internal)?;
     let manager = state.manager.clone();
@@ -191,6 +255,76 @@ async fn renew_certificate(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn update_validation_context(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ValidationContextUpdateRequest>,
+) -> ApiResult<StatusCode> {
+    authorize(&state, &headers)?;
+    let update = CaValidationContextUpdate {
+        chain: decode_base64_list(&request.chain_base64)?,
+        crls: decode_base64_list(&request.crls_base64)?,
+        manifests: decode_base64_list(&request.manifests_base64)?,
+        tal: decode_base64(&request.tal_base64)?,
+    };
+    let _permit = state.writer.acquire().await.map_err(internal)?;
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || manager.update_validation_context(update))
+        .await
+        .map_err(internal)?
+        .map_err(|error| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_context_update_failed",
+                error.to_string(),
+            )
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_toa_reviews(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<crate::ToaReviewStatus>>> {
+    authorize(&state, &headers)?;
+    state
+        .manager
+        .toa_review_statuses()
+        .map(Json)
+        .map_err(internal)
+}
+
+async fn review_toa(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(object_name): AxumPath<String>,
+    Json(request): Json<ToaReviewRequest>,
+) -> ApiResult<Json<crate::ToaReviewStatus>> {
+    authorize(&state, &headers)?;
+    if !valid_object_name(&object_name) || !object_name.ends_with(".toa") {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            "invalid TOA repository object name".into(),
+        ));
+    }
+    let _permit = state.writer.acquire().await.map_err(internal)?;
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || {
+        manager.review_toa(&object_name, request.roa_overlap_justification)
+    })
+    .await
+    .map_err(internal)?
+    .map(Json)
+    .map_err(|error| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "toa_review_failed",
+            error.to_string(),
+        )
+    })
+}
+
 fn decode_base64(value: &str) -> ApiResult<Vec<u8>> {
     STANDARD
         .decode(value)
@@ -201,20 +335,159 @@ fn decode_base64_list(values: &[String]) -> ApiResult<Vec<Vec<u8>>> {
     values.iter().map(|value| decode_base64(value)).collect()
 }
 
-async fn create_roa(
+async fn list_roas(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<RoaRequest>,
-) -> ApiResult<(StatusCode, Json<ObjectResponse>)> {
-    create_signed_object(state, headers, ObjectDefinition::Roa(request)).await
+) -> ApiResult<Json<Vec<RoaConfigurationView>>> {
+    authorize(&state, &headers)?;
+    state
+        .manager
+        .roa_configurations()
+        .map(Json)
+        .map_err(internal)
+}
+
+async fn update_roas(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<RoaDelta>, JsonRejection>,
+) -> std::result::Result<Json<RoaDeltaResponse>, Response> {
+    authorize(&state, &headers).map_err(IntoResponse::into_response)?;
+    let Json(delta) = payload.map_err(|rejection| {
+        (
+            rejection.status(),
+            Json(serde_json::json!({
+                "error": "invalid_roa_request",
+                "message": format!("ROA 请求体无法解析：{}", rejection.body_text()),
+            })),
+        )
+            .into_response()
+    })?;
+    let _permit = state
+        .writer
+        .acquire()
+        .await
+        .map_err(internal)
+        .map_err(IntoResponse::into_response)?;
+    let manager = state.manager.clone();
+    match tokio::task::spawn_blocking(move || manager.update_roas(delta)).await {
+        Ok(Ok(response)) => Ok(Json(response)),
+        Ok(Err(error)) => {
+            if let Some(rejected) = error.downcast_ref::<RoaDeltaRejected>() {
+                Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "roa_delta_rejected",
+                        "message": rejected.to_string(),
+                        "details": rejected.0,
+                    })),
+                )
+                    .into_response())
+            } else {
+                Err(internal(error).into_response())
+            }
+        }
+        Err(error) => Err(internal(error).into_response()),
+    }
 }
 
 async fn create_aspa(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<AspaRequest>,
-) -> ApiResult<(StatusCode, Json<ObjectResponse>)> {
-    create_signed_object(state, headers, ObjectDefinition::Aspa(request)).await
+    payload: std::result::Result<Json<AspaDelta>, JsonRejection>,
+) -> std::result::Result<Json<ObjectDeltaResponse>, Response> {
+    authorize(&state, &headers).map_err(IntoResponse::into_response)?;
+    let Json(delta) = parse_object_json(payload, "invalid_aspa_delta")?;
+    let _permit = state
+        .writer
+        .acquire()
+        .await
+        .map_err(|error| internal(error).into_response())?;
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || manager.update_aspas(delta))
+        .await
+        .map_err(|error| internal(error).into_response())?
+        .map(Json)
+        .map_err(|error| invalid_delta("aspa_delta_rejected", error))
+}
+
+async fn create_toa(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<ToaRequest>, JsonRejection>,
+) -> std::result::Result<(StatusCode, Json<ObjectResponse>), Response> {
+    let Json(request) = parse_object_json(payload, "invalid_toa_request")?;
+    create_signed_object(state, headers, ObjectDefinition::Toa(request))
+        .await
+        .map_err(IntoResponse::into_response)
+}
+
+async fn create_sispi(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<SispiDelta>, JsonRejection>,
+) -> std::result::Result<Json<ObjectDeltaResponse>, Response> {
+    authorize(&state, &headers).map_err(IntoResponse::into_response)?;
+    let Json(delta) = parse_object_json(payload, "invalid_sispi_delta")?;
+    let _permit = state
+        .writer
+        .acquire()
+        .await
+        .map_err(|error| internal(error).into_response())?;
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || manager.update_sispis(delta))
+        .await
+        .map_err(|error| internal(error).into_response())?
+        .map(Json)
+        .map_err(|error| invalid_delta("sispi_delta_rejected", error))
+}
+
+fn invalid_delta(code: &'static str, error: anyhow::Error) -> Response {
+    ApiError(StatusCode::UNPROCESSABLE_ENTITY, code, error.to_string()).into_response()
+}
+
+fn parse_object_json<T>(
+    payload: std::result::Result<Json<T>, JsonRejection>,
+    code: &'static str,
+) -> std::result::Result<Json<T>, Response> {
+    payload.map_err(|rejection| {
+        ApiError(rejection.status(), code, rejection.body_text()).into_response()
+    })
+}
+
+async fn list_aspas(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<crate::SignedObjectView>>> {
+    list_signed_objects(state, headers, ObjectKind::Aspa).await
+}
+
+async fn list_toas(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<crate::SignedObjectView>>> {
+    list_signed_objects(state, headers, ObjectKind::Toa).await
+}
+
+async fn list_sispis(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<crate::SignedObjectView>>> {
+    list_signed_objects(state, headers, ObjectKind::Sispi).await
+}
+
+async fn list_signed_objects(
+    state: ApiState,
+    headers: HeaderMap,
+    kind: ObjectKind,
+) -> ApiResult<Json<Vec<crate::SignedObjectView>>> {
+    authorize(&state, &headers)?;
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || manager.signed_objects(kind))
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .map_err(internal)
 }
 
 async fn create_signed_object(
@@ -230,148 +503,210 @@ async fn create_signed_object(
             e.to_string(),
         )
     })?;
-    let key = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            ApiError(
-                StatusCode::BAD_REQUEST,
-                "missing_idempotency_key",
-                "Idempotency-Key header is required".into(),
-            )
-        })?;
-    validate_idempotency_key(key)?;
-    let kind = definition.kind();
-    let id = idempotency_id(kind, key);
-    let request_hash = digest_hex(&serde_json::to_vec(&definition).map_err(internal)?);
-    let requested_name = match &definition {
-        ObjectDefinition::Roa(_) => format!("roa-{}.roa", &id[..24]),
-        ObjectDefinition::Aspa(request) => format!("aspa-AS{}.asa", request.customer_asn),
-    };
-    let record = IdempotencyRecord {
-        request_hash,
-        definition,
-        requested_name,
-        published_name: None,
-    };
     let _permit = state.writer.acquire().await.map_err(internal)?;
     let manager = state.manager.clone();
-    let idempotency = state.idempotency.clone();
-    let id_for_task = id.clone();
-    let (created, stored) = tokio::task::spawn_blocking(move || {
-        issue_idempotently(manager.as_ref(), idempotency.as_ref(), &id_for_task, record)
-    })
-    .await
-    .map_err(internal)?
-    .map_err(|e| {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "issuance_failed",
-            e.to_string(),
-        )
-    })?;
-    let status = if created {
+    let result =
+        tokio::task::spawn_blocking(move || signed_objects::issue(manager.as_ref(), definition))
+            .await
+            .map_err(internal)?
+            .map_err(issue_error)?;
+    let status = if result.action == IssueAction::Created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
+    let action = match result.action {
+        IssueAction::Created => "created",
+        IssueAction::Updated => "updated",
+        IssueAction::Unchanged => "unchanged",
+    };
     Ok((
         status,
         Json(ObjectResponse {
-            id,
-            download_url: format!(
-                "/repository/{}",
-                stored
-                    .published_name
-                    .as_deref()
-                    .expect("issued object name")
-            ),
-            object_name: stored.published_name.expect("issued object name"),
-            created,
+            logical_key: result.logical_key,
+            download_url: format!("/repository/{}", result.object_name),
+            object_name: result.object_name,
+            created: result.action == IssueAction::Created,
+            updated: result.action == IssueAction::Updated,
+            status: action,
+            advisories: result.advisories,
         }),
     ))
 }
 
-async fn get_roa(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult<Json<ObjectResponse>> {
-    get_signed_object(state, headers, id, ObjectKind::Roa).await
+fn issue_error(error: anyhow::Error) -> ApiError {
+    if error.is::<crate::ca::toa_policy::ToaRoaOverlapJustificationRequired>() {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "toa_roa_overlap_justification_required",
+            error.to_string(),
+        )
+    } else if error.is::<crate::ResourceAuthorizationError>() {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "resource_not_held",
+            error.to_string(),
+        )
+    } else if error.is::<crate::CaIssuanceUnavailable>() {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ca_issuance_unavailable",
+            error.to_string(),
+        )
+    } else if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+    {
+        internal(error)
+    } else {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "issuance_failed",
+            error.to_string(),
+        )
+    }
 }
 
 async fn get_aspa(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult<Json<ObjectResponse>> {
-    get_signed_object(state, headers, id, ObjectKind::Aspa).await
+    AxumPath(customer_asn): AxumPath<String>,
+) -> ApiResult<Json<crate::SignedObjectView>> {
+    let customer_asn = parse_asn_identifier(&customer_asn)?;
+    get_signed_object(
+        state,
+        headers,
+        ObjectKind::Aspa,
+        format!("aspa:AS{customer_asn}"),
+    )
+    .await
 }
 
-async fn delete_roa(
+async fn get_toa(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult<StatusCode> {
-    withdraw_signed_object(state, headers, id, ObjectKind::Roa).await
+    AxumPath(key): AxumPath<String>,
+) -> ApiResult<Json<crate::SignedObjectView>> {
+    validate_content_key(&key)?;
+    get_signed_object(state, headers, ObjectKind::Toa, format!("toa:{key}")).await
 }
 
-async fn delete_aspa(
+async fn get_sispi(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult<StatusCode> {
-    withdraw_signed_object(state, headers, id, ObjectKind::Aspa).await
+    AxumPath(as_id): AxumPath<String>,
+) -> ApiResult<Json<crate::SignedObjectView>> {
+    let as_id = parse_asn_identifier(&as_id)?;
+    get_signed_object(
+        state,
+        headers,
+        ObjectKind::Sispi,
+        format!("sispi:AS{as_id}"),
+    )
+    .await
 }
 
-async fn withdraw_signed_object(
+async fn withdraw_aspa(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(customer_asn): AxumPath<String>,
+) -> ApiResult<Json<ObjectWithdrawal>> {
+    let customer_asn = parse_asn_identifier(&customer_asn)?;
+    withdraw_logical_object(
+        state,
+        headers,
+        ObjectKind::Aspa,
+        format!("aspa:AS{customer_asn}"),
+    )
+    .await
+}
+
+async fn withdraw_toa(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(key): AxumPath<String>,
+) -> ApiResult<Json<ObjectWithdrawal>> {
+    validate_content_key(&key)?;
+    withdraw_logical_object(state, headers, ObjectKind::Toa, format!("toa:{key}")).await
+}
+
+async fn withdraw_sispi(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(as_id): AxumPath<String>,
+) -> ApiResult<Json<ObjectWithdrawal>> {
+    let as_id = parse_asn_identifier(&as_id)?;
+    withdraw_logical_object(
+        state,
+        headers,
+        ObjectKind::Sispi,
+        format!("sispi:AS{as_id}"),
+    )
+    .await
+}
+
+async fn withdraw_logical_object(
     state: ApiState,
     headers: HeaderMap,
-    id: String,
-    expected: ObjectKind,
-) -> ApiResult<StatusCode> {
+    kind: ObjectKind,
+    logical_key: String,
+) -> ApiResult<Json<ObjectWithdrawal>> {
     authorize(&state, &headers)?;
-    validate_id(&id)?;
-    let record = read_record(state.idempotency.as_ref(), &id).map_err(not_found)?;
-    if record.definition.kind() != expected {
-        return Err(not_found("object kind mismatch"));
-    }
     let _permit = state.writer.acquire().await.map_err(internal)?;
     let manager = state.manager.clone();
     tokio::task::spawn_blocking(move || {
-        manager.withdraw_definition(&record.definition, &record.requested_name)
+        signed_objects::withdraw(manager.as_ref(), kind, &logical_key)
     })
     .await
     .map_err(internal)?
-    .map_err(internal)?;
-    Ok(StatusCode::NO_CONTENT)
+    .map_err(internal)?
+    .map(Json)
+    .ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "signed_object_not_found",
+            "signed object is not in the current CA inventory".into(),
+        )
+    })
+}
+
+async fn withdraw_published_object(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResult<Json<ObjectWithdrawal>> {
+    authorize(&state, &headers)?;
+    withdrawable_object_kind(&name)?;
+    let _permit = state.writer.acquire().await.map_err(internal)?;
+    let manager = state.manager.clone();
+    let withdrawn = tokio::task::spawn_blocking(move || manager.withdraw_published_object(&name))
+        .await
+        .map_err(internal)?
+        .map_err(internal)?
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "signed_object_not_found",
+                "signed object is not in the current CA inventory".into(),
+            )
+        })?;
+    Ok(Json(withdrawn))
 }
 
 async fn get_signed_object(
     state: ApiState,
     headers: HeaderMap,
-    id: String,
-    expected_kind: ObjectKind,
-) -> ApiResult<Json<ObjectResponse>> {
+    kind: ObjectKind,
+    logical_key: String,
+) -> ApiResult<Json<crate::SignedObjectView>> {
     authorize(&state, &headers)?;
-    validate_id(&id)?;
-    let record = read_record(state.idempotency.as_ref(), &id).map_err(not_found)?;
-    if record.definition.kind() != expected_kind {
-        return Err(not_found("object kind mismatch"));
-    }
-    let object_name = record
-        .published_name
-        .ok_or_else(|| not_found("object not issued"))?;
-    let created = state
-        .manager
-        .has_published_object(&object_name)
-        .map_err(internal)?;
-    Ok(Json(ObjectResponse {
-        id,
-        download_url: format!("/repository/{object_name}"),
-        object_name,
-        created,
-    }))
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || signed_objects::get(manager.as_ref(), kind, &logical_key))
+        .await
+        .map_err(internal)?
+        .map_err(internal)?
+        .map(Json)
+        .ok_or_else(|| not_found("signed object is not in the current CA inventory"))
 }
 
 async fn download_object(
@@ -389,13 +724,7 @@ async fn download_object(
         .manager
         .read_published_object(&name)
         .map_err(not_found)?;
-    let content_type = if name.ends_with(".roa") {
-        "application/rpki-roa"
-    } else if name.ends_with(".asa") {
-        "application/rpki-aspa"
-    } else {
-        "application/octet-stream"
-    };
+    let content_type = repository_content_type(&name);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
@@ -403,47 +732,94 @@ async fn download_object(
         .map_err(internal)
 }
 
-fn issue_idempotently(
-    manager: &CaManager,
-    idempotency: &dyn IdempotencyStore,
-    id: &str,
-    new_record: IdempotencyRecord,
-) -> Result<(bool, IdempotencyRecord)> {
-    let mut record = if let Some(bytes) = idempotency.get(id)? {
-        let existing: IdempotencyRecord = serde_json::from_slice(&bytes)?;
-        if existing.request_hash != new_record.request_hash {
-            anyhow::bail!("Idempotency-Key was already used with a different request");
-        }
-        existing
-    } else {
-        let bytes = serde_json::to_vec_pretty(&new_record)?;
-        if idempotency.put_if_absent(id, &bytes)? {
-            new_record
-        } else {
-            let existing = read_record(idempotency, id)?;
-            if existing.request_hash != new_record.request_hash {
-                anyhow::bail!("Idempotency-Key was already used with a different request");
-            }
-            existing
-        }
-    };
-    let logical_key = record.definition.logical_key(&record.requested_name);
-    if let Some(name) = manager.published_name(&logical_key)? {
-        record.published_name = Some(name);
-        idempotency.replace(id, &serde_json::to_vec_pretty(&record)?)?;
-        return Ok((false, record));
+fn repository_content_type(name: &str) -> &'static str {
+    match name.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("cer") => "application/pkix-cert",
+        Some("crl") => "application/pkix-crl",
+        Some("mft") => "application/rpki-manifest",
+        Some("roa") => "application/rpki-roa",
+        Some("asa") => "application/rpki-aspa",
+        Some("toa") => "application/rpki-toa",
+        Some("sav") => "application/rpki-sispi",
+        _ => "application/octet-stream",
     }
-    let output = manager.sign_object(record.definition.clone(), &record.requested_name)?;
-    record.published_name = Some(output.name);
-    idempotency.replace(id, &serde_json::to_vec_pretty(&record)?)?;
-    Ok((true, record))
 }
 
-fn read_record(store: &dyn IdempotencyStore, id: &str) -> Result<IdempotencyRecord> {
-    let bytes = store
-        .get(id)?
-        .context("idempotency record does not exist")?;
-    Ok(serde_json::from_slice(&bytes)?)
+async fn list_repository_objects(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<RepositoryList>> {
+    authorize(&state, &headers)?;
+    let manager = state.manager.clone();
+    let objects = tokio::task::spawn_blocking(move || -> Result<_> {
+        let signed_objects = manager.list_published_signed_objects()?;
+        let mut objects = manager
+            .list_published_objects()?
+            .into_iter()
+            .map(|name| {
+                let bytes = manager.read_published_object(&name)?;
+                let withdrawable = signed_objects.contains(&name) && !name.ends_with(".roa");
+                Ok(summarize(name, &bytes, withdrawable))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        objects.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(objects)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    Ok(Json(RepositoryList { objects }))
+}
+
+async fn inspect_repository_object(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResult<Json<RepositoryInspection>> {
+    authorize(&state, &headers)?;
+    if !valid_object_name(&name) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            "invalid repository object name".into(),
+        ));
+    }
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || {
+        let bytes = manager.read_published_object(&name)?;
+        inspect(name, bytes)
+    })
+    .await
+    .map_err(internal)?
+    .map(Json)
+    .map_err(|error| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "inspection_failed",
+            error.to_string(),
+        )
+    })
+}
+
+async fn validate_repository_object(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResult<Json<crate::ValidationReport>> {
+    authorize(&state, &headers)?;
+    if !valid_object_name(&name) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            "invalid repository object name".into(),
+        ));
+    }
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || manager.validate_published_object(&name))
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .map_err(internal)
 }
 
 fn authorize(state: &ApiState, headers: &HeaderMap) -> ApiResult<()> {
@@ -462,31 +838,25 @@ fn authorize(state: &ApiState, headers: &HeaderMap) -> ApiResult<()> {
     Ok(())
 }
 
-fn validate_idempotency_key(value: &str) -> ApiResult<()> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
-    {
+fn validate_content_key(value: &str) -> ApiResult<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "invalid_idempotency_key",
-            "use 1-128 ASCII letters, digits, '-', '_', '.', or ':'".into(),
+            "invalid_logical_key",
+            "TOA key must contain exactly 64 hexadecimal characters".into(),
         ));
     }
     Ok(())
 }
 
-fn validate_id(value: &str) -> ApiResult<()> {
-    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(ApiError(
+fn parse_asn_identifier(value: &str) -> ApiResult<u32> {
+    value.parse().map_err(|_| {
+        ApiError(
             StatusCode::BAD_REQUEST,
-            "invalid_id",
-            "invalid request id".into(),
-        ));
-    }
-    Ok(())
+            "invalid_asn",
+            "ASN path parameter must be an unsigned 32-bit integer".into(),
+        )
+    })
 }
 
 fn valid_object_name(value: &str) -> bool {
@@ -497,15 +867,33 @@ fn valid_object_name(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-fn digest_hex(value: &[u8]) -> String {
-    Sha256::digest(value)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-fn idempotency_id(kind: ObjectKind, key: &str) -> String {
-    digest_hex(format!("{kind}:{key}").as_bytes())
+fn withdrawable_object_kind(value: &str) -> ApiResult<ObjectKind> {
+    if !valid_object_name(value) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_object_name",
+            "invalid repository object name".into(),
+        ));
+    }
+    let kind = value
+        .rsplit_once('.')
+        .and_then(|(_, extension)| ObjectKind::from_extension(extension))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "object_not_withdrawable",
+                "only published signed objects can be withdrawn".into(),
+            )
+        })?;
+    if kind == ObjectKind::Roa {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "roa_managed_by_authorizations",
+            "ROA files are derived; remove their authorization configurations through /api/v1/roas"
+                .into(),
+        ));
+    }
+    Ok(kind)
 }
 
 fn internal(error: impl std::fmt::Display) -> ApiError {

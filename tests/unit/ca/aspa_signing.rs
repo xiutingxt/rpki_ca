@@ -3,6 +3,62 @@ use crate::infrastructure::state_store::LocalStateStore;
 use rpki::repository::{aspa::Aspa, cert::Cert, crl::Crl, manifest::Manifest, tal::TalInfo};
 use std::fs;
 
+#[test]
+fn batch_update_is_idempotent_and_supports_replacement_and_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = CaConfig {
+        development_asns: vec![64496, 64497],
+        ..CaConfig::default()
+    };
+    let ca = crate::CaManager::init(dir.path(), config).unwrap();
+    let initial = crate::AspaDelta {
+        added: vec![
+            AspaRequest {
+                customer_asn: 64496,
+                provider_asns: vec![64500],
+            },
+            AspaRequest {
+                customer_asn: 64497,
+                provider_asns: vec![64501],
+            },
+        ],
+        removed: vec![],
+    };
+    let created = ca.update_aspas(initial.clone()).unwrap();
+    assert_eq!(created.created, vec!["aspa:AS64496", "aspa:AS64497"]);
+    let names: Vec<_> = created
+        .objects
+        .iter()
+        .map(|object| object.object_name.clone())
+        .collect();
+
+    let replay = ca.update_aspas(initial).unwrap();
+    assert!(replay.created.is_empty());
+    assert_eq!(replay.unchanged, vec!["aspa:AS64496", "aspa:AS64497"]);
+    assert_eq!(
+        replay
+            .objects
+            .iter()
+            .map(|object| object.object_name.clone())
+            .collect::<Vec<_>>(),
+        names
+    );
+
+    let changed = ca
+        .update_aspas(crate::AspaDelta {
+            added: vec![AspaRequest {
+                customer_asn: 64496,
+                provider_asns: vec![64502],
+            }],
+            removed: vec![64497, 64555],
+        })
+        .unwrap();
+    assert_eq!(changed.updated, vec!["aspa:AS64496"]);
+    assert_eq!(changed.removed, vec!["aspa:AS64497"]);
+    assert_eq!(changed.unchanged, vec!["aspa:AS64555"]);
+    assert_eq!(changed.objects.len(), 1);
+}
+
 fn repository_file(root: &std::path::Path, extension: &str) -> std::path::PathBuf {
     fs::read_dir(root.join("repository"))
         .unwrap()
@@ -62,8 +118,17 @@ fn signs_aspa_and_atomically_updates_crl_and_manifest() {
     assert!(state.object(&aspa_name).is_some());
 
     let serial = state.object(&aspa_name).unwrap().serial;
-    assert!(ca.withdraw_aspa(64496).unwrap());
-    assert!(!ca.withdraw_aspa(64496).unwrap());
+    let withdrawal = ca.withdraw_published_object(&aspa_name).unwrap().unwrap();
+    assert_eq!(withdrawal.object_name, aspa_name);
+    assert_eq!(withdrawal.kind, ObjectKind::Aspa);
+    assert_eq!(withdrawal.ee_certificate_serial, serial);
+    assert!(withdrawal.ee_certificate_revoked);
+    assert!(withdrawal.revocation_time.is_some());
+    assert!(
+        ca.withdraw_published_object(&withdrawal.object_name)
+            .unwrap()
+            .is_none()
+    );
     assert!(!dir.path().join("repository").join(&aspa_name).exists());
     let crl = Crl::decode(
         fs::read(repository_file(dir.path(), "crl"))
@@ -72,6 +137,7 @@ fn signs_aspa_and_atomically_updates_crl_and_manifest() {
     )
     .unwrap();
     assert!(crl.contains(serial.into()));
+    assert_eq!(crl.crl_number(), withdrawal.crl_number.into());
     let manifest = Manifest::decode(
         fs::read(repository_file(dir.path(), "mft"))
             .unwrap()
@@ -80,6 +146,7 @@ fn signs_aspa_and_atomically_updates_crl_and_manifest() {
     )
     .unwrap();
     let (_, content) = manifest.validate(&resource_cert, true).unwrap();
+    assert_eq!(content.manifest_number(), withdrawal.manifest_number.into());
     assert!(
         !content
             .iter()

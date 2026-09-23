@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-log "Cleaning Compose project '${PROJECT_NAME}', containers, network, and data volume"
+log "Cleaning Compose project '${PROJECT_NAME}', containers, network, and bind-mounted test data"
 if compose down --volumes --remove-orphans > /dev/null 2>&1; then
   log "[PASS] Compose resources removed"
 else

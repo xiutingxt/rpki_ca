@@ -1,2 +1,3 @@
-pub(crate) mod config;
-pub(crate) mod manager;
+pub mod config;
+pub mod manager;
+pub(crate) mod signed_objects;

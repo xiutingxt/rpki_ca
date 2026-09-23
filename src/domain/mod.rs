@@ -1,2 +1,2 @@
-pub(crate) mod model;
-pub(crate) mod resources;
+pub mod model;
+pub mod resources;

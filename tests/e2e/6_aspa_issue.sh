@@ -6,12 +6,12 @@ prepare_environment
 REQUEST="$(aspa_request_json)"
 log "ASPA input: Customer AS${E2E_ASPA_CUSTOMER_ASN}; Providers: ${E2E_ASPA_PROVIDER_ASNS[*]}"
 RESPONSE="$(curl --silent --show-error --fail --request POST "${BASE_URL}/api/v1/aspas" \
-  --header "Authorization: Bearer ${API_TOKEN}" --header "Idempotency-Key: ${E2E_ASPA_IDEMPOTENCY_KEY}" \
-  --header 'Content-Type: application/json' --data "${REQUEST}")"
+  --header "Authorization: Bearer ${API_TOKEN}" \
+  --header 'Content-Type: application/json' --data "{\"added\":[${REQUEST}],\"removed\":[]}")"
 log "API response: ${RESPONSE}"
 OBJECT_NAME="$(printf '%s' "${RESPONSE}" | sed -n 's/.*"object_name":"\([^"]*\)".*/\1/p')"
 [[ "${OBJECT_NAME}" =~ ^[A-Za-z0-9_-]{27}\.asa$ ]] || { log "ERROR: object_name is not the RFC 6481 key-derived ASPA name"; exit 1; }
-printf '%s' "${RESPONSE}" | grep -q '"created":true' || { log "ERROR: ASPA was not newly created"; exit 1; }
+printf '%s' "${RESPONSE}" | grep -q '"created":\["aspa:AS' || { log "ERROR: ASPA was not newly created"; exit 1; }
 printf '%s' "${OBJECT_NAME}" >"${STATE_DIR}/aspa-object-name"
 DOWNLOAD_DIR="${STATE_DIR}/downloads"; mkdir -p "${DOWNLOAD_DIR}"
 CERT_NAME="$(publication_name cer)"
