@@ -3,7 +3,7 @@ set -Eeuo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 prepare_environment
 REQUEST="$(toa_request_json)"
-RESPONSE="$(curl --silent --show-error --fail --request POST "${BASE_URL}/api/v1/toas" --header "Authorization: Bearer ${API_TOKEN}" --header 'Content-Type: application/json' --data "${REQUEST}")"
+RESPONSE="$(curl --silent --show-error --fail --request POST "${BASE_URL}/api/v1/toas" --header "Authorization: Bearer ${API_TOKEN}" --header 'Content-Type: application/json' --data "{\"added\":[${REQUEST}],\"removed\":[]}")"
 log "TOA API response: ${RESPONSE}"
 OBJECT_NAME="$(printf '%s' "${RESPONSE}" | sed -n 's/.*"object_name":"\([^"]*\)".*/\1/p')"
 LOGICAL_KEY="$(printf '%s' "${RESPONSE}" | sed -n 's/.*"logical_key":"toa:\([0-9a-f]*\)".*/\1/p')"

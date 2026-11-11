@@ -16,6 +16,17 @@ pub struct ToaRequest {
     pub roa_overlap_justification: Option<String>,
 }
 
+/// A batch update of complete TOA Cartesian-product objects. Each entry is
+/// identified by the digest of its canonical `asns` and `prefixes` content.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToaDelta {
+    #[serde(default)]
+    pub added: Vec<ToaRequest>,
+    #[serde(default)]
+    pub removed: Vec<ToaRequest>,
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/objects/toa.rs"]
 mod tests;

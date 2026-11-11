@@ -14,8 +14,9 @@ bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 ipnet = { version = "2", features = ["serde"] }
-rpki = { version = "0.19.3", features = ["repository", "serde-support"] }
+rpki = { version = "0.19.3", features = ["ca", "serde-support"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", features = ["oid"] }

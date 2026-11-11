@@ -110,7 +110,7 @@ toa_request_json() {
 
 sispi_request_json() {
   local separator="" value
-  printf '{"as_id":%s,"addresses":[' "${E2E_SISPI_AS_ID}"
+  printf '{"asn":%s,"addresses":[' "${E2E_SISPI_ASN}"
   for value in "${E2E_SISPI_ADDRESSES[@]}"; do
     printf '%s"%s"' "${separator}" "${value}"
     separator=","

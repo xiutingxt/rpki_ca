@@ -1,14 +1,14 @@
 use crate::ca::{ImportedCa, publication};
 use crate::infrastructure::{
     repository::LocalRepository,
-    signing::{SignedObjectOutput, SigningProvider, SoftwareSigner},
+    signing::{SigningProvider, SoftwareSigner},
     state_store::LocalStateStore,
 };
 use crate::{
     AspaDelta, AspaRequest, CaCertificateRenewal, CaCertificateStatus, CaConfig, CaImportRequest,
     CaValidationContextUpdate, CertificateAuthority, ObjectDefinition, ObjectDeltaResponse,
     ObjectWithdrawal, RoaConfigurationView, RoaDelta, RoaDeltaResponse, RoaRequest, SispiDelta,
-    SispiRequest, ToaRequest, ToaReviewStatus,
+    SispiRequest, ToaDelta, ToaRequest, ToaReviewStatus,
 };
 use anyhow::{Context, Result, bail};
 #[cfg(unix)]
@@ -26,7 +26,7 @@ pub struct CaManager {
 impl CaManager {
     pub fn init(root: impl AsRef<Path>, mut config: CaConfig) -> Result<Self> {
         let root = root.as_ref();
-        validate_config(&config)?;
+        config.validate_development()?;
         create_transaction(root, move |staging| {
             let (signer, pem) = SoftwareSigner::generate().map_err(anyhow::Error::msg)?;
             let certificate_name =
@@ -128,6 +128,10 @@ impl CaManager {
         self.ca.update_sispis(delta)
     }
 
+    pub fn update_toas(&self, delta: ToaDelta) -> Result<ObjectDeltaResponse> {
+        self.ca.update_toas(delta)
+    }
+
     pub fn sign_toa(&self, request: &ToaRequest, object_name: &str) -> Result<Vec<u8>> {
         self.ca.sign_toa(request, object_name)
     }
@@ -144,8 +148,8 @@ impl CaManager {
         self.ca.withdraw_toa(object_name)
     }
 
-    pub fn withdraw_sispi(&self, as_id: u32) -> Result<bool> {
-        self.ca.withdraw_sispi(as_id)
+    pub fn withdraw_sispi(&self, asn: u32) -> Result<bool> {
+        self.ca.withdraw_sispi(asn)
     }
 
     pub fn withdraw_published_object(&self, object_name: &str) -> Result<Option<ObjectWithdrawal>> {
@@ -162,14 +166,6 @@ impl CaManager {
 
     pub fn list_published_signed_objects(&self) -> Result<BTreeSet<String>> {
         self.ca.list_published_signed_objects()
-    }
-
-    pub(crate) fn sign_object(
-        &self,
-        definition: ObjectDefinition,
-        object_name: &str,
-    ) -> Result<SignedObjectOutput> {
-        self.ca.sign_object(definition, object_name)
     }
 
     pub fn issue_object(
@@ -254,14 +250,7 @@ impl CaManager {
 }
 
 fn validate_config(config: &CaConfig) -> Result<()> {
-    config.timing.validate()?;
-    if config.development_ca_validity_days == 0 {
-        bail!("development_ca_validity_days must be positive");
-    }
-    if config.ca_renew_before_days == 0 {
-        bail!("ca_renew_before_days must be positive");
-    }
-    Ok(())
+    config.validate()
 }
 
 fn save_config(root: &Path, config: &CaConfig) -> Result<()> {

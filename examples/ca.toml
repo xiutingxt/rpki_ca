@@ -1,0 +1,16 @@
+# Omitted fields use defaults. name is a local label, not the certificate Subject.
+name = "my-lab-ca"
+repository_uri = "rsync://localhost/my-lab/"
+development_ca_validity_days = 365
+ca_renew_before_days = 30
+development_resources = ["192.0.2.0/24", "2001:db8::/48"]
+development_asns = [64496]
+
+[timing]
+roa_valid_weeks = 52
+aspa_valid_weeks = 52
+toa_valid_weeks = 52
+sispi_valid_weeks = 52
+publish_next_hours = 720
+publish_next_jitter_hours = 0
+publish_hours_before_next = 8

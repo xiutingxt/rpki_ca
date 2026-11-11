@@ -357,6 +357,67 @@ fn imported_subordinate_revalidates_the_full_path_to_its_tal() {
     );
     assert!(report.checks[0].message.contains("配置的 TAL"));
 
+    // This lower-level fixture bypasses CaManager's configuration persistence.
+    fs::write(
+        child_root.path().join("ca.toml"),
+        toml::to_string(&CaConfig {
+            name: "imported-child".into(),
+            repository_uri: child_base.to_string(),
+            certificate_uri: parent_base
+                .join(child_cert_name.as_bytes())
+                .unwrap()
+                .to_string(),
+            ..CaConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let exported_root = tempfile::tempdir().unwrap();
+    let exported = exported_root.path().join("snapshot");
+    let (valid, exported_report) = crate::experiment::export(child_root.path(), &exported).unwrap();
+    assert!(valid, "{exported_report}");
+    assert!(crate::experiment::verify(&exported, None).is_ok());
+    let inventory: serde_json::Value =
+        serde_json::from_slice(&fs::read(exported.join("experiment.json")).unwrap()).unwrap();
+    assert_eq!(inventory["parent_context"]["mode"], "imported");
+    let materials = inventory["parent_materials"].as_array().unwrap();
+    assert_eq!(materials.len(), 3);
+    assert_eq!(materials[0]["source"], "parent_context.chain_base64[0]");
+    assert!(
+        materials[0]["details"]["not_after_utc"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z')
+    );
+    assert!(
+        materials[1]["details"]["next_update_utc"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z')
+    );
+    assert!(materials[2]["details"]["ee_certificate"]["not_after_utc"].is_string());
+    let mut tampered = inventory.clone();
+    tampered["parent_materials"][1]["details"]["next_update"] = 0.into();
+    fs::write(
+        exported.join("experiment.json"),
+        serde_json::to_vec_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let (valid, report) = crate::experiment::verification_report(&exported, None);
+    assert!(!valid);
+    assert_eq!(report["error"]["code"], "metadata");
+    fs::write(
+        exported.join("experiment.json"),
+        serde_json::to_vec_pretty(&inventory).unwrap(),
+    )
+    .unwrap();
+    let info = crate::ca_info(child_root.path()).unwrap();
+    assert_eq!(info["mode"], "imported");
+    assert_eq!(
+        info["certificate"]["repository_uri"],
+        child_base.to_string()
+    );
+
     let mut broken_manifest = parent_manifest;
     let last = broken_manifest.last_mut().unwrap();
     *last ^= 0x01;

@@ -13,7 +13,7 @@ pub(crate) fn issue(request: &SispiRequest, params: Params<'_>) -> Result<Vec<u8
             v6_addresses.push(Prefix::new(address, 128));
         }
     }
-    let builder = SispiBuilder::new(Asn::from(request.as_id), v4_addresses, v6_addresses);
+    let builder = SispiBuilder::new(Asn::from(request.asn), v4_addresses, v6_addresses);
     let signed = params.signed_object_builder()?;
     let object = builder
         .finalize(signed, params.signer, params.signer.primary_key_id())

@@ -41,7 +41,7 @@ fn reports_valid_current_roa_and_sispi_publications() {
 
     ca.sign_sispi(
         &SispiRequest {
-            as_id: 64496,
+            asn: 64496,
             addresses: vec!["192.0.2.1".parse().unwrap()],
         },
         "report-test.sav",

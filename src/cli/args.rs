@@ -1,6 +1,6 @@
+use crate::RoaPayload;
 use clap::{CommandFactory, Parser, Subcommand};
 use ipnet::IpNet;
-use rpki_ca::RoaPayload;
 use std::{net::IpAddr, path::PathBuf, str::FromStr};
 
 #[derive(Parser)]
@@ -12,8 +12,52 @@ struct Cli {
 
 #[derive(Subcommand)]
 pub(super) enum Command {
+    /// Register a publisher and explicitly synchronize the local CA to Krill.
+    Publisher {
+        #[command(subcommand)]
+        command: PublisherCommand,
+    },
+    /// Inspect configuration and public certificates without opening the private key.
+    CaInfo {
+        #[arg(long, default_value = "data")]
+        dir: PathBuf,
+    },
+    /// Validate a development CA TOML configuration without creating a CA.
+    CheckConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Export a committed public snapshot without loading the CA private key.
+    ExportExperiment {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Sign an isolated experiment and export a verified, private-key-free bundle.
+    Experiment {
+        #[arg(long)]
+        request: PathBuf,
+        /// Override experiment CRL/Manifest validity in days (1..=363; default 30).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=363))]
+        valid_days: Option<u32>,
+        /// New output directory; existing paths are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify an exported experiment offline, without CA state or private keys.
+    VerifyExperiment {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Optional independently trusted TAL; otherwise use the bundle's test TAL.
+        #[arg(long)]
+        tal: Option<PathBuf>,
+    },
     /// Initialize a development trust-anchor CA.
     Init {
+        /// TOML configuration. Mutually exclusive with explicit CA settings.
+        #[arg(long, conflicts_with_all = ["repository_uri", "name", "development_ca_validity_days", "ca_renew_before_days", "roa_valid_weeks", "aspa_valid_weeks", "sispi_valid_weeks", "toa_valid_weeks", "toa_review_days", "publish_next_hours", "publish_next_jitter_hours", "publish_hours_before_next", "resources", "asn_resources"])]
+        config: Option<PathBuf>,
         #[arg(long, default_value = "data")]
         dir: PathBuf,
         #[arg(long, default_value = "rsync://localhost/rpki/")]
@@ -151,8 +195,8 @@ pub(super) enum Command {
     SignSispi {
         #[arg(long, default_value = "data")]
         dir: PathBuf,
-        #[arg(long)]
-        as_id: u32,
+        #[arg(long = "asn", value_name = "ASN")]
+        asn: u32,
         #[arg(long = "address", required = true)]
         addresses: Vec<IpAddr>,
         #[arg(long)]
@@ -176,8 +220,8 @@ pub(super) enum Command {
     WithdrawSispi {
         #[arg(long, default_value = "data")]
         dir: PathBuf,
-        #[arg(long)]
-        as_id: u32,
+        #[arg(long = "asn", value_name = "ASN")]
+        asn: u32,
     },
     /// Reissue the CRL and manifest; schedule this before manifest nextUpdate.
     Refresh {
@@ -259,8 +303,8 @@ pub(super) enum Command {
         dir: PathBuf,
         #[arg(long)]
         object: String,
-        #[arg(long)]
-        as_id: u32,
+        #[arg(long = "asn", value_name = "ASN")]
+        asn: u32,
         #[arg(long = "address", required = true)]
         addresses: Vec<IpAddr>,
     },
@@ -273,6 +317,46 @@ pub(super) enum Command {
         /// Environment variable containing the bearer token.
         #[arg(long, default_value = "API_TOKEN")]
         token_env: String,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(super) enum PublisherCommand {
+    /// Create a separate BPKI identity and publisher-request.xml in a new directory.
+    Init {
+        #[arg(long)]
+        publisher_dir: PathBuf,
+        #[arg(long)]
+        handle: String,
+    },
+    /// Import the out-of-band Repository Response; optionally generate a new CA config.
+    Configure {
+        #[arg(long)]
+        publisher_dir: PathBuf,
+        #[arg(long)]
+        response: PathBuf,
+        #[arg(long)]
+        ca_config_output: Option<PathBuf>,
+        /// Permit plain HTTP only in isolated experiments.
+        #[arg(long)]
+        allow_http: bool,
+    },
+    /// Reconcile the entire committed publication point (dedicated publisher required).
+    Sync {
+        #[arg(long)]
+        publisher_dir: PathBuf,
+        #[arg(long)]
+        dir: PathBuf,
+        /// Inspect differences without modifying remote objects or binding the CA.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        allow_http: bool,
+        /// Additional trusted PEM TLS root certificates (BPKI trust remains separate).
+        #[arg(long)]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout_seconds: u64,
     },
 }
 

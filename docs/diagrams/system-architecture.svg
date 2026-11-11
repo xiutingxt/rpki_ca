@@ -26,21 +26,21 @@
   <rect class="layer" x="80" y="325" width="1440" height="150" rx="14"/>
   <text class="layer-title" x="105" y="357">接口层</text>
   <rect class="entry" x="210" y="380" width="380" height="68" rx="10"/>
-  <text class="node-title" x="400" y="408" text-anchor="middle">HTTP API · api.rs</text><text class="node-text" x="400" y="431" text-anchor="middle">鉴权 · 幂等 · CORS · 写请求串行化</text>
+  <text class="node-title" x="400" y="408" text-anchor="middle">HTTP API · api/server.rs</text><text class="node-text" x="400" y="431" text-anchor="middle">鉴权 · JSON · CORS · 写入串行化</text>
   <rect class="entry" x="1010" y="380" width="380" height="68" rx="10"/>
-  <text class="node-title" x="1200" y="408" text-anchor="middle">CLI · main.rs</text><text class="node-text" x="1200" y="431" text-anchor="middle">参数解析 · JSON 输入 · serve 启动</text>
+  <text class="node-title" x="1200" y="408" text-anchor="middle">CLI · cli/</text><text class="node-text" x="1200" y="431" text-anchor="middle">参数解析 · JSON 输入 · serve 启动</text>
 
   <rect class="layer" x="80" y="500" width="1440" height="115" rx="14"/>
   <text class="layer-title" x="105" y="532">应用层</text>
   <rect class="app" x="500" y="540" width="600" height="52" rx="10"/>
-  <text class="node-title" x="800" y="568" text-anchor="middle">CaManager · 统一应用用例入口</text><text class="node-text" x="800" y="586" text-anchor="middle">init · import · open · sign_roa · refresh</text>
+  <text class="node-title" x="800" y="568" text-anchor="middle">CaManager · 统一应用用例入口</text><text class="node-text" x="800" y="586" text-anchor="middle">init · import · update_* · refresh · renew_certificate</text>
 
   <rect class="layer" x="80" y="640" width="1440" height="170" rx="14"/>
   <text class="layer-title" x="105" y="672">RPKI 领域层</text>
   <rect class="domain" x="120" y="700" width="320" height="78" rx="10"/><text class="node-title" x="280" y="729" text-anchor="middle">CertificateAuthority</text><text class="node-text" x="280" y="752" text-anchor="middle">CA 生命周期、签发与发布编排</text>
-  <rect class="domain" x="475" y="700" width="250" height="78" rx="10"/><text class="node-title" x="600" y="729" text-anchor="middle">RoaRequest</text><text class="node-text" x="600" y="752" text-anchor="middle">ASN / Prefix / maxLength 校验</text>
-  <rect class="domain" x="760" y="700" width="300" height="78" rx="10"/><text class="node-title" x="910" y="729" text-anchor="middle">CertifiedResources</text><text class="node-text" x="910" y="752" text-anchor="middle">证书 IP 资源覆盖判断</text>
-  <rect class="domain" x="1095" y="700" width="300" height="78" rx="10"/><text class="node-title" x="1245" y="729" text-anchor="middle">ObjectIssuer</text><text class="node-text" x="1245" y="752" text-anchor="middle">ROA · CRL · Manifest 构造签名</text>
+  <rect class="domain" x="475" y="700" width="250" height="78" rx="10"/><text class="node-title" x="600" y="729" text-anchor="middle">ObjectDefinition</text><text class="node-text" x="600" y="752" text-anchor="middle">ROA / ASPA / TOA / SiSPI 定义</text>
+  <rect class="domain" x="760" y="700" width="300" height="78" rx="10"/><text class="node-title" x="910" y="729" text-anchor="middle">CertifiedResources</text><text class="node-text" x="910" y="752" text-anchor="middle">证书 IP / ASN 资源授权</text>
+  <rect class="domain" x="1095" y="700" width="300" height="78" rx="10"/><text class="node-title" x="1245" y="729" text-anchor="middle">ObjectIssuer</text><text class="node-text" x="1245" y="752" text-anchor="middle">签名对象 · CRL · Manifest 构造</text>
 
   <rect class="layer" x="80" y="835" width="1440" height="105" rx="14"/>
   <text class="layer-title" x="105" y="866">端口 → 当前本地适配器</text>
@@ -49,14 +49,14 @@
   <rect class="infra" x="825" y="877" width="355" height="43" rx="8"/><text class="node-title" x="1002" y="904" text-anchor="middle">PublicationRepository → LocalRepository</text>
   <rect class="store" x="1210" y="877" width="285" height="43" rx="8"/><text class="node-title" x="1352" y="896" text-anchor="middle">Object Inventory</text><text class="node-text" x="1352" y="914" text-anchor="middle">规范化领域状态去重</text>
 
-  <path class="edge" d="M282 274 V345 H400 V380"/><text class="edge-label" x="305" y="336">HTTPS</text>
+  <path class="edge" d="M282 274 V345 H400 V380"/><text class="edge-label" x="305" y="336">HTTP / HTTPS</text>
   <path class="edge" d="M797 274 V345 H1200 V380"/><text class="edge-label" x="970" y="336">命令行</text>
   <path class="edge-dashed" d="M1312 274 V325"/><text class="edge-label" x="1325" y="314">启动</text>
   <path class="edge" d="M400 448 V515 H730 V540"/><path class="edge" d="M1200 448 V515 H870 V540"/>
   <path class="edge" d="M800 592 V665 H280 V700"/>
   <path class="edge" d="M440 739 H475"/><path class="edge" d="M725 739 H760"/><path class="edge" d="M1060 739 H1095"/>
   <path class="edge" d="M280 778 V825 H270 V877"/><path class="edge" d="M350 778 V815 H630 V877"/><path class="edge" d="M1245 778 V820 H1002 V877"/>
-  <path class="edge-dashed" d="M400 448 V485 H1352 V877"/><text class="edge-label" x="1170" y="480">API 幂等记录</text>
+  <path class="edge-dashed" d="M350 778 V815 H1352 V877"/><text class="edge-label" x="1170" y="832">对象定义与发布清单</text>
 
   <circle cx="75" cy="1000" r="7" fill="#0284c7"/><text class="legend" x="90" y="1005">接口</text>
   <circle cx="165" cy="1000" r="7" fill="#7c3aed"/><text class="legend" x="180" y="1005">应用服务</text>

@@ -1,11 +1,11 @@
 //! Axum server, routes, handlers, and HTTP DTOs.
 
 use super::repository::{RepositoryInspection, RepositoryList, inspect, summarize};
-use crate::application::signed_objects::{self, IssueAction};
+use crate::application::signed_objects;
 use crate::{
     AspaDelta, CaCertificateRenewal, CaCertificateStatus, CaManager, CaValidationContextUpdate,
-    ObjectDefinition, ObjectDeltaResponse, ObjectKind, ObjectWithdrawal, RoaConfigurationView,
-    RoaDelta, RoaDeltaRejected, RoaDeltaResponse, SispiDelta, ToaRequest,
+    ObjectDeltaResponse, ObjectKind, ObjectWithdrawal, RoaConfigurationView, RoaDelta,
+    RoaDeltaRejected, RoaDeltaResponse, SispiDelta, ToaDelta,
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -26,19 +26,9 @@ use tower_http::cors::CorsLayer;
 #[derive(Clone)]
 struct ApiState {
     manager: Arc<CaManager>,
+    root: Arc<PathBuf>,
     token: Arc<str>,
     writer: Arc<Semaphore>,
-}
-
-#[derive(Debug, Serialize)]
-struct ObjectResponse {
-    logical_key: String,
-    object_name: String,
-    download_url: String,
-    created: bool,
-    updated: bool,
-    status: &'static str,
-    advisories: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +96,7 @@ pub async fn serve(
     let manager = Arc::new(CaManager::open(&root).context("cannot open CA for API server")?);
     let state = ApiState {
         manager,
+        root: Arc::new(root),
         token: token.into(),
         writer: Arc::new(Semaphore::new(1)),
     };
@@ -156,7 +147,7 @@ pub async fn serve(
         .route("/api/v1/toas/{name}/reviews", post(review_toa))
         .route("/api/v1/sispis", get(list_sispis).post(create_sispi))
         .route(
-            "/api/v1/sispis/{as_id}",
+            "/api/v1/sispis/{asn}",
             get(get_sispi).delete(withdraw_sispi),
         )
         .route(
@@ -165,6 +156,8 @@ pub async fn serve(
         )
         .route("/api/v1/ca/certificate", get(certificate_status))
         .route("/api/v1/ca/resources", get(certified_resources))
+        .route("/api/v1/ca/info", get(ca_information))
+        .route("/api/v1/experiments/snapshot", get(experiment_snapshot))
         .route("/api/v1/ca/certificate-renewals", post(renew_certificate))
         .route(
             "/api/v1/ca/validation-context",
@@ -187,7 +180,8 @@ pub async fn serve(
             CorsLayer::new()
                 .allow_origin(origin)
                 .allow_methods([Method::GET, Method::POST, Method::DELETE])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .expose_headers(["x-experiment-valid".parse::<header::HeaderName>()?]),
         );
     }
     let listener = TcpListener::bind(bind)
@@ -225,6 +219,101 @@ async fn certified_resources(
         .certified_resources()
         .map(Json)
         .map_err(internal)
+}
+
+async fn ca_information(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let root = state.root.clone();
+    tokio::task::spawn_blocking(move || crate::application::info::ca_info(&root))
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .map_err(internal)
+}
+
+async fn experiment_snapshot(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    authorize(&state, &headers)?;
+    let root = state.root.clone();
+    let (bytes, valid) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let temporary = tempfile::tempdir()?;
+        let output = temporary.path().join("experiment");
+        let (valid, _) = crate::experiment::export(&root, &output)?;
+        Ok((tar_experiment(&output)?, valid))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=experiment.tar",
+        )
+        .header("x-experiment-valid", if valid { "true" } else { "false" })
+        .body(Body::from(bytes))
+        .map_err(internal)
+}
+
+fn tar_experiment(root: &std::path::Path) -> Result<Vec<u8>> {
+    use std::{fs, io::Write};
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            for child in fs::read_dir(entry.path())? {
+                let child = child?;
+                files.push((
+                    format!("repository/{}", child.file_name().to_string_lossy()),
+                    child.path(),
+                ));
+            }
+        } else {
+            files.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            ));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut archive = Vec::new();
+    for (name, path) in files {
+        let data = fs::read(path)?;
+        anyhow::ensure!(
+            name.is_ascii() && name.len() <= 100,
+            "invalid tar entry name: {name}"
+        );
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        for (offset, width, number) in [
+            (100, 8, 0o644u64),
+            (108, 8, 0),
+            (116, 8, 0),
+            (124, 12, data.len() as u64),
+            (136, 12, 0),
+        ] {
+            let value = format!("{:0width$o}\0", number, width = width - 1);
+            header[offset..offset + width].copy_from_slice(value.as_bytes());
+        }
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+        let value = format!("{:06o}\0 ", checksum);
+        header[148..156].copy_from_slice(value.as_bytes());
+        archive.write_all(&header)?;
+        archive.write_all(&data)?;
+        archive.resize(archive.len().div_ceil(512) * 512, 0);
+    }
+    archive.resize(archive.len() + 1024, 0);
+    Ok(archive)
 }
 
 async fn renew_certificate(
@@ -414,12 +503,21 @@ async fn create_aspa(
 async fn create_toa(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    payload: std::result::Result<Json<ToaRequest>, JsonRejection>,
-) -> std::result::Result<(StatusCode, Json<ObjectResponse>), Response> {
-    let Json(request) = parse_object_json(payload, "invalid_toa_request")?;
-    create_signed_object(state, headers, ObjectDefinition::Toa(request))
+    payload: std::result::Result<Json<ToaDelta>, JsonRejection>,
+) -> std::result::Result<Json<ObjectDeltaResponse>, Response> {
+    authorize(&state, &headers).map_err(IntoResponse::into_response)?;
+    let Json(delta) = parse_object_json(payload, "invalid_toa_delta")?;
+    let _permit = state
+        .writer
+        .acquire()
         .await
-        .map_err(IntoResponse::into_response)
+        .map_err(|error| internal(error).into_response())?;
+    let manager = state.manager.clone();
+    tokio::task::spawn_blocking(move || manager.update_toas(delta))
+        .await
+        .map_err(|error| internal(error).into_response())?
+        .map(Json)
+        .map_err(toa_delta_error)
 }
 
 async fn create_sispi(
@@ -443,6 +541,17 @@ async fn create_sispi(
 }
 
 fn invalid_delta(code: &'static str, error: anyhow::Error) -> Response {
+    ApiError(StatusCode::UNPROCESSABLE_ENTITY, code, error.to_string()).into_response()
+}
+
+fn toa_delta_error(error: anyhow::Error) -> Response {
+    let code = if error.is::<crate::ca::toa_policy::ToaRoaOverlapJustificationRequired>() {
+        "toa_roa_overlap_justification_required"
+    } else if error.is::<crate::ResourceAuthorizationError>() {
+        "resource_not_held"
+    } else {
+        "toa_delta_rejected"
+    };
     ApiError(StatusCode::UNPROCESSABLE_ENTITY, code, error.to_string()).into_response()
 }
 
@@ -490,83 +599,6 @@ async fn list_signed_objects(
         .map_err(internal)
 }
 
-async fn create_signed_object(
-    state: ApiState,
-    headers: HeaderMap,
-    definition: ObjectDefinition,
-) -> ApiResult<(StatusCode, Json<ObjectResponse>)> {
-    authorize(&state, &headers)?;
-    definition.validate().map_err(|e| {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_object",
-            e.to_string(),
-        )
-    })?;
-    let _permit = state.writer.acquire().await.map_err(internal)?;
-    let manager = state.manager.clone();
-    let result =
-        tokio::task::spawn_blocking(move || signed_objects::issue(manager.as_ref(), definition))
-            .await
-            .map_err(internal)?
-            .map_err(issue_error)?;
-    let status = if result.action == IssueAction::Created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    let action = match result.action {
-        IssueAction::Created => "created",
-        IssueAction::Updated => "updated",
-        IssueAction::Unchanged => "unchanged",
-    };
-    Ok((
-        status,
-        Json(ObjectResponse {
-            logical_key: result.logical_key,
-            download_url: format!("/repository/{}", result.object_name),
-            object_name: result.object_name,
-            created: result.action == IssueAction::Created,
-            updated: result.action == IssueAction::Updated,
-            status: action,
-            advisories: result.advisories,
-        }),
-    ))
-}
-
-fn issue_error(error: anyhow::Error) -> ApiError {
-    if error.is::<crate::ca::toa_policy::ToaRoaOverlapJustificationRequired>() {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "toa_roa_overlap_justification_required",
-            error.to_string(),
-        )
-    } else if error.is::<crate::ResourceAuthorizationError>() {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "resource_not_held",
-            error.to_string(),
-        )
-    } else if error.is::<crate::CaIssuanceUnavailable>() {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ca_issuance_unavailable",
-            error.to_string(),
-        )
-    } else if error
-        .chain()
-        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
-    {
-        internal(error)
-    } else {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "issuance_failed",
-            error.to_string(),
-        )
-    }
-}
-
 async fn get_aspa(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -594,16 +626,10 @@ async fn get_toa(
 async fn get_sispi(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    AxumPath(as_id): AxumPath<String>,
+    AxumPath(asn): AxumPath<String>,
 ) -> ApiResult<Json<crate::SignedObjectView>> {
-    let as_id = parse_asn_identifier(&as_id)?;
-    get_signed_object(
-        state,
-        headers,
-        ObjectKind::Sispi,
-        format!("sispi:AS{as_id}"),
-    )
-    .await
+    let asn = parse_asn_identifier(&asn)?;
+    get_signed_object(state, headers, ObjectKind::Sispi, format!("sispi:AS{asn}")).await
 }
 
 async fn withdraw_aspa(
@@ -633,16 +659,10 @@ async fn withdraw_toa(
 async fn withdraw_sispi(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    AxumPath(as_id): AxumPath<String>,
+    AxumPath(asn): AxumPath<String>,
 ) -> ApiResult<Json<ObjectWithdrawal>> {
-    let as_id = parse_asn_identifier(&as_id)?;
-    withdraw_logical_object(
-        state,
-        headers,
-        ObjectKind::Sispi,
-        format!("sispi:AS{as_id}"),
-    )
-    .await
+    let asn = parse_asn_identifier(&asn)?;
+    withdraw_logical_object(state, headers, ObjectKind::Sispi, format!("sispi:AS{asn}")).await
 }
 
 async fn withdraw_logical_object(

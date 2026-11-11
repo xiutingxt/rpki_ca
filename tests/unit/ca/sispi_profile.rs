@@ -20,7 +20,7 @@ fn roundtrips_ipv4_and_ipv6_addresses() {
     );
     let bytes = content.encode_ref().to_captured(Mode::Der).into_bytes();
     let decoded = decode_content(bytes).unwrap();
-    assert_eq!(decoded.as_id(), 64496.into());
+    assert_eq!(decoded.asn(), 64496.into());
     assert_eq!(
         decoded.v4_addresses(),
         &[Prefix::new(

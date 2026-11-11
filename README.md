@@ -1,531 +1,490 @@
 # rpki-ca
 
-一个使用 Rust 实现的 RPKI CA。它可以创建隔离测试用的 Trust Anchor、导入资源证书与匹配私钥、签发 ROA、ASPA、实验性 TOA 和 SiSPI，并同步维护 CRL 和 Manifest。TOA 使用临时内容类型 OID `1.2.840.113549.1.9.16.1.999`；SiSPI 除使用临时内容类型 OID `1.2.840.113549.1.9.16.1.998` 外按 `draft-chen-sidrops-sispi-06` 实现。IANA 分配正式 OID 后必须替换对应常量并重新签发对象。
+一个用于**创建单 CA、签发 RPKI 签名对象并导出实验文件**的 Rust 工具。当前支持 ROA、ASPA、实验性 TOA 和 SiSPI；签发时自动维护对象 EE 证书、CRL、Manifest 和本地发布仓库。
 
-> 当前项目适合开发、协议验证和受控测试。若用于生产，还需要接入 HSM、RFC 8181 Publication Server、完善的身份与权限系统、审计日志、备份恢复和运行监控。
-
-## 当前能力
-
-- 创建开发用自签 Trust Anchor。
-- 导入已有 TA 或 Resource Certificate（RC）及私钥。
-- 按 RFC 9829 使用每级当前 Manifest 验证证书链、CRL、证书有效期、SIA 和逐级资源覆盖。
-- 验证 ROA 前缀和 `maxLength` 是否被 CA 证书资源覆盖。
-- 为证书、CRL 和 Manifest 分配持久化唯一序列号。
-- 替换 ROA 时撤销旧 EE 证书。
-- 通过可恢复的两阶段日志一致更新 ROA、CRL、Manifest、状态和本地仓库。
-- 通过 JSON 文件或 CLI 参数提交 ROA 请求。
-- 通过带 Bearer Token 和幂等保护的 HTTP API 提交 ROA 请求。
-- 使用 CA 持有的 ASN 资源签发和验证 ASPA `.asa` 对象。
-- 按 `draft-chen-sidrops-sispi-06` 签发和验证 SiSPI `.sav` 对象。
-- 使用 Docker Compose 启动常驻 API 服务。
-
-## 架构
-
-`src` 按职责划分，入口、用例编排、领域模型和外部实现不再混放在同一目录：
+本项目的主要使用流程是：
 
 ```text
-src/
-├── main.rs                 # 仅负责启动并调用 cli::run()
-├── lib.rs                  # library crate 模块边界与公共 API
-├── cli/
-│   ├── mod.rs              # CLI 模块声明与入口导出
-│   ├── args.rs             # clap 参数、子命令和 CLI 输入类型
-│   ├── commands.rs         # 各子命令的应用层调用与输出
-│   └── io.rs               # 文件读取和外部导出路径检查
-├── api/                    # HTTP 路由、鉴权与 DTO
-├── application/            # 配置与 CaManager 应用用例
-├── domain/                 # 签发请求及资源授权模型
-├── ca/                     # CA 核心流程、对象签发、父链验证、状态模型
-├── infrastructure/         # 文件仓库、状态存储、幂等存储、软件签名器
-└── validation/             # TAL 完整路径、当前发布点及各类签名对象验证
+配置资源与有效期 → 创建 CA → 签发对象 → 导出对象或材料包 → 在实验中解析或离线验证
 ```
 
-- `CaManager`：应用层入口，负责加载 CA 并编排初始化、导入、签发和刷新命令。
-- `CertificateAuthority`：单个 CA 的领域服务。
-- `CertifiedResources`：封装证书中的 IPv4/IPv6/ASN 资源集合及授权判断。
-- `ObjectIssuer`：构造并签名 ROA、ASPA、TOA、SiSPI、CRL 和 Manifest。
-- `IssuedPublication`：ROA、ASPA 及后续签署对象共用的已签名发布事务输入。
-- `ObjectDefinition`：描述期望签发的 ROA、ASPA、TOA 或 SiSPI；它与已经签名发布的对象元数据分离。
-- `ValidatedPublication`：资源授权、扩展名和逻辑身份均已验证的内部发布命令。
-- `Params::signed_object_builder()`：所有对象共用的 RFC 6488 EE/CMS 参数构造入口。
-- `ProfiledSignedObject`：TOA、SiSPI 等本地 Profile 共用的 RFC 6488 编码和 CMS/EE/CRL 验证骨架；各对象仍独立负责 ASN.1 与资源规则。
-- 已发布对象使用 `kind + logical_key` 跟踪；ASPA 的逻辑键和文件名由 Customer ASN 稳定确定，更新 Provider 集合会替换旧对象并撤销旧 EE 证书。
-- `PublicationRepository`：发布后端抽象；当前适配器是事务化的 `LocalRepository`。
-- `SigningProvider`：对象签名抽象；当前适配器是 `SoftwareSigner`，未来可替换为 PKCS#11/HSM 实现。
-- `CaStateStore`：CA 状态存储和排他锁抽象；当前适配器是 `LocalStateStore`。
-- `CaState`：纯状态模型，管理序列号、已签发对象、撤销记录和 Manifest 状态。
-- HTTP API：薄适配层，CLI 和 API 最终调用相同的 `CaManager` 签发流程。
+本文默认使用 Docker 执行 CLI，流程 A 和流程 B 无需启动 HTTP API；需要验证服务调用链时可选择 Compose/API 批量流程。开发 CA 是隔离实验用的自签 Trust Anchor，不属于公共 RPKI 信任体系。当前重点是开发与协议实验；远程仓库可按需使用 [Krill 发布同步](docs/krill-publication.md)。
 
-项目当前只生成一个名为 `rpki-ca` 的二进制 target。上述模块仍保持分层，但不额外生成容易与二进制混淆的 `rpki_ca` library target。
+## 选择使用方式
 
-核心 CA 类型名是 `CertificateAuthority`。它不持有根目录或文件路径，只依赖 `SigningProvider`、`CaStateStore` 和 `PublicationRepository`。文件系统只是当前适配器的存储方式，并不是 CA 本身的领域含义。
+| 你的目的 | 使用方式 | 最终得到什么 |
+|---|---|---|
+| 只需要一批签好的对象文件 | **流程 A：一次性实验** | 公开材料包；临时 CA 私钥自动删除 |
+| 需要反复签发、更新或撤回对象 | **流程 B：保留 CA** | 持久 CA 目录、单对象副本，以及可随时导出的公开快照 |
+| 希望先启动服务，再通过 HTTP API 批量提交同一份实验 JSON | **Compose/API 批量流程** | 持久容器与 CA，以及经过离线验证的公开快照 |
+| 已有自己的资源证书和匹配私钥 | [导入 CA](docs/import-ca.md)，然后按流程 B 签发 | 在所获资源范围内签发的对象 |
+| 希望验证器通过 RRDP/rsync 拉取对象 | [Krill 发布仓库接入](docs/krill-publication.md) | 独立仓库中的公开发布集；使用持久 CA 并显式同步 |
 
-## Docker Compose 快速开始
+- [准备环境](#准备环境)
+- [流程 A：一次性创建并导出实验对象](#流程-a一次性创建并导出实验对象)
+- [Compose/API 批量签发与导出](#composeapi-批量签发与导出)
+- [流程 B：保留 CA，逐个签发并导出](#流程-b保留-ca逐个签发并导出)
+- [导出后如何使用与验证](#导出后如何使用与验证)
+- [有效期、刷新与重新导出](#有效期刷新与重新导出)
+- [通过 Krill 发布到远程仓库](#通过-krill-发布到远程仓库)
+- [常见问题](#常见问题)
+- [其他入口与开发文档](#其他入口与开发文档)
 
-复制环境变量示例：
+## 准备环境
+
+**宿主机只需要 Docker 和 Docker Compose，不需要安装 Rust/Cargo、平台编译工具链、Python 或 OpenSSL。** 所有命令在项目根目录的 Linux Bash 或 Windows Git Bash 中执行，Docker 使用 Linux 容器。
+
+拿到源码后构建镜像，编译在 Docker 内完成：
+
+```bash
+docker build -f docker/Dockerfile -t rpki-ca:0.1.0 .
+docker build --target tools -f docker/Dockerfile -t rpki-ca-tools:local .
+bash scripts/rpki-ca-docker.sh --help
+```
+
+第一条构建运行镜像，第二条构建包含 Python/OpenSSL 的辅助工具镜像。首次构建需要联网下载基础镜像和依赖；镜像已构建后，可直接运行下文各流程，无需重复构建。修改源码后才需要重新构建。
+
+`bash scripts/rpki-ca-docker.sh` 将项目目录挂载到容器的 `/work` 并直接执行 CA 命令。相对路径以项目根目录为准；CA、publisher 身份和导出文件保存在宿主机的挂载目录内，不随临时容器退出而删除。输入和输出应放在项目目录内，绝对路径应使用容器路径。
+
+Compose/API 批量脚本会自动构建运行镜像和工具镜像，只需先配置 `docker/.env` 中的 `API_TOKEN`。完整的镜像、路径、网络和 Krill TLS 说明见 [Docker 使用指南](docs/docker-workflows.md)。Krill 还需配置注册信息、可达的仓库地址和 TLS，容器内的 `localhost` 指向该容器自身。
+
+## 流程 A：一次性创建并导出实验对象
+
+适合只需要对象文件、无需保留签发 CA 的实验。
+
+### 1. 用默认输入生成一份材料包
+
+```bash
+bash scripts/rpki-ca-docker.sh experiment \
+  --request examples/experiment.json \
+  --output ./data/experiments/run-001
+```
+
+默认输入包含一个 TOA 和一个 SiSPI。脚本依次完成：
+
+1. 检查输入、资源和有效期配置。
+2. 在临时目录创建自签实验 CA。
+3. 签发请求中的对象，同步生成 CRL 和 Manifest。
+4. 导出公开材料，使用导出后的字节执行离线验证。
+5. 验证成功后保存材料包，并删除临时 CA 和私钥。
+
+成功时输出 `status: "valid"`。`--output` 必须指定不存在的新目录；再次运行请换成 `run-002` 等名称。
+
+### 2. 自定义对象和 CA
+
+可以复制 [examples/experiment.json](examples/experiment.json) 后修改。完整四类对象示例已保存在 [examples/experiment-all.json](examples/experiment-all.json)，可直接运行：
+
+```bash
+bash scripts/rpki-ca-docker.sh experiment \
+  --request examples/experiment-all.json \
+  --output ./data/experiments/all-objects-001
+```
+
+下面是一份可自定义的四类对象请求：
+
+```bash
+cat > experiment.json <<'JSON'
+{
+  "ca": {
+    "name": "my-object-experiment",
+    "repository_uri": "rsync://localhost/experiment/",
+    "development_ca_validity_days": 365,
+    "ca_renew_before_days": 30,
+    "roa_valid_weeks": 52,
+    "aspa_valid_weeks": 52,
+    "toa_valid_weeks": 52,
+    "sispi_valid_weeks": 52
+  },
+  "valid_days": 30,
+  "resources": ["192.0.2.0/24", "2001:db8::/48"],
+  "asn_resources": [64496],
+  "objects": [
+    {
+      "kind": "roa",
+      "definition": {
+        "asn": 64496,
+        "prefixes": [{"prefix": "192.0.2.0/24", "max_length": 24}]
+      }
+    },
+    {
+      "kind": "aspa",
+      "definition": {"customer_asn": 64496, "provider_asns": [64497, 64498]}
+    },
+    {
+      "kind": "toa",
+      "definition": {
+        "asns": [64496, 64497],
+        "prefixes": ["192.0.2.0/24", "2001:db8::/48"]
+      }
+    },
+    {
+      "kind": "sispi",
+      "definition": {"asn": 64496, "addresses": ["192.0.2.1", "2001:db8::1"]}
+    }
+  ]
+}
+JSON
+
+bash scripts/rpki-ca-docker.sh experiment \
+  --request ./experiment.json \
+  --output ./data/experiments/four-objects-001
+```
+
+| 字段 | 作用 |
+|---|---|
+| `ca.name` | 本地实验名称；不改变证书 Subject，Subject 仍由公钥生成 |
+| `ca.repository_uri` | 写入证书及相关材料的仓库基础 URI；配置它不会启动 rsync 服务 |
+| `ca.development_ca_validity_days` | 新建 CA 证书寿命 |
+| `ca.*_valid_weeks` | 各类对象 EE 证书的寿命策略 |
+| `valid_days` | 本次实验的 CRL/Manifest 有效天数，默认 30，无随机偏移 |
+| `resources` | 实验 CA 持有的 IPv4/IPv6 资源 |
+| `asn_resources` | 实验 CA 持有的 ASN 资源 |
+| `objects` | 要签发的对象定义；可以只保留需要的类型 |
+
+`ca` 及其中字段可以省略。`valid_days` 范围为 1～363，且必须比 CA 及本次所签对象的 EE 寿命至少短一天。命令行 `--valid-days 60` 可以覆盖 JSON 中的天数；该参数不改变对象 EE 自身的寿命策略。更多约束见 [CA 配置](docs/ca-configuration.md)。
+
+每次运行都会新建密钥和证书，因此相同 JSON 不保证生成相同文件名、序列号或签名字节；可比较的是规范化后的对象内容。
+
+### 3. 找到签名对象文件
+
+生成的目录结构如下，文件名以实际输出为准：
+
+```text
+four-objects-001/
+├── experiment.json       # 输入、对象清单、Profile、CA 与上级材料元数据
+├── trust-anchor.tal      # 此材料包使用的信任锚定位信息
+├── verification.json     # 导出时的验证结果
+└── repository/
+    ├── <ca-key-id>.cer    # CA 证书
+    ├── <ca-key-id>.crl    # 吊销列表
+    ├── <ca-key-id>.mft    # Manifest
+    ├── <object-name>.roa  # ROA
+    ├── <object-name>.asa  # ASPA，扩展名是 .asa
+    ├── <object-name>.toa  # TOA
+    └── <object-name>.sav  # SiSPI，扩展名是 .sav
+```
+
+对象是 DER 编码的 CMS 文件，内部已包含对应 EE 证书。只做对象解析或将字节交给实验程序时，读取 `repository/` 下所需扩展名的文件即可。若需要验证信任链、吊销与发布集，请保留整个材料包及原文件名。
+
+材料包不包含 CA 私钥、`state.toml` 或完整 `ca.toml`，不能将它当作可继续签发的 CA 目录。
+
+## Compose/API 批量签发与导出
+
+如果实验要验证“先部署服务，再通过 HTTP 请求签发”的完整路径，可在 Linux Bash 或 Windows Git Bash 下使用 `scripts/experiment-compose.sh`。它在工具容器内转换 JSON、检查已有 CA 配置并发送 HTTP 请求，宿主机不需要 Rust、Python 或 `jq`。其他容器流程见 [Docker 使用指南](docs/docker-workflows.md)。
+
+先准备 Compose 的基础环境，其中 `API_TOKEN` 必须设置：
 
 ```bash
 cp docker/.env.example docker/.env
+# 编辑 docker/.env，至少把 API_TOKEN 改成自己的长随机值。
 ```
 
-至少应把 `.env` 中的测试令牌替换为足够长的随机值：
-
-```dotenv
-RPKI_CA_IMAGE_NAME=rpki-ca
-RPKI_CA_IMAGE_VERSION=0.1.0
-REPOSITORY_URI=rsync://localhost/rpki/
-CA_DATA_DIR=../data/docker
-CA_NAME=development-ca
-DEVELOPMENT_CA_VALIDITY_DAYS=365
-CA_RENEW_BEFORE_DAYS=30
-ROA_VALID_WEEKS=52
-ASPA_VALID_WEEKS=52
-SISPI_VALID_WEEKS=52
-TOA_VALID_WEEKS=52
-TOA_REVIEW_DAYS=90
-PUBLISH_NEXT_HOURS=24
-PUBLISH_NEXT_JITTER_HOURS=4
-PUBLISH_HOURS_BEFORE_NEXT=8
-CA_RESOURCES=192.0.2.0/24 2001:db8::/48
-API_TOKEN=replace-with-a-long-random-token
-API_PORT=3000
-CORS_ORIGIN=http://localhost:5173
-```
-
-`CORS_ORIGIN` 是可选项。当前端和 API 不同源时，将它设置为前端的精确 Origin；不要填写路径，也不要使用 `*`。
-
-`DEVELOPMENT_CA_VALIDITY_DAYS` 只控制开发 TA 证书。各对象的一次性 EE 证书分别使用 `ROA_VALID_WEEKS`、`ASPA_VALID_WEEKS`、`TOA_VALID_WEEKS` 和 `SISPI_VALID_WEEKS`，默认均为 52 周；`notBefore` 回退 5 分钟以容忍时钟偏差，`notAfter` 不会超过签发 CA 证书。`TOA_REVIEW_DAYS` 是 TOA 定期运行复核周期，默认 90 天（周期是本项目的可配置运行策略，草案只要求定期复核而未规定天数）。Manifest/CRL 默认使用 24 小时加 0～4 小时随机 jitter 的更新窗口。API 服务每 10 分钟检查一次，并在距离 `nextUpdate` 少于 8 小时时自动刷新。这些值只在首次初始化 CA 目录时写入 `ca.toml`，普通签发请求不能覆盖它们。
-
-构建并启动：
+然后用与一次性流程相同的请求文件运行：
 
 ```bash
-docker compose -f docker/compose.yaml up -d --build
-docker compose -f docker/compose.yaml ps
+bash scripts/experiment-compose.sh \
+  --request ./experiment.json \
+  --output ./data/experiments/compose-001
 ```
 
-Compose 构建的镜像默认命名为 `rpki-ca:0.1.0`，版本与 `Cargo.toml` 一致。可通过 `.env` 中的 `RPKI_CA_IMAGE_NAME` 和 `RPKI_CA_IMAGE_VERSION` 自定义镜像仓库名和标签。若本机已有使用旧匿名镜像创建的容器，请执行上面的 `up -d --build`；Compose 会用带名称和版本的新镜像重建容器。
+脚本按以下顺序执行：
 
-API 默认监听 `http://127.0.0.1:3000`。`CA_DATA_DIR` 指定的宿主机目录绑定到容器的 `/var/lib/rpki`，CA 数据位于宿主机的 `<CA_DATA_DIR>/ca` 和容器的 `/var/lib/rpki/ca`。默认的 `../data/docker` 相对于 `docker/compose.yaml`，即仓库根目录下的 `data/docker`。CA 子目录不能直接作为挂载点，因为初始化的原子目录切换需要替换该子目录。
+1. 从 `experiment.json` 读取 CA 名称、资源、对象有效期和 `valid_days` 发布窗口（省略时为 30 天）。
+2. 执行 `docker compose up -d --build`，等待 `/healthz` 可用。
+3. 将 ROA、ASPA、TOA、SiSPI 定义转换为各接口的 `{added, removed}` 增量请求并提交。
+4. 在容器内运行 `export-experiment`，对当前公开仓库执行完整离线复验。
+5. 把不含私钥的快照移到 `--output`；默认继续运行服务并保留 CA。
 
-上述 CA 初始化变量只在绑定目录中不存在 `/var/lib/rpki/ca/ca.toml` 时生效。修改资源或仓库配置后若要从头创建测试 CA，可执行：
+默认持久数据在 `data/compose-experiment/`，Compose 项目名为 `rpki-ca-experiment`，API 地址为 `http://127.0.0.1:3000`。后续可以再次运行脚本，或直接调用 HTTP API 继续签发。重复的 ROA 配置会先查询后跳过；其他三类对象由服务端按目标状态幂等处理。
+
+已有 CA 不会因 JSON 改动而重新初始化。脚本会先比较名称、仓库 URI、资源和关键有效期；不一致时停止并要求选择新的数据目录。例如，创建另一套独立 CA：
 
 ```bash
-docker compose -f docker/compose.yaml down
-rm -rf data/docker/ca
-docker compose -f docker/compose.yaml up -d
+bash scripts/experiment-compose.sh \
+  --request ./experiment.json \
+  --data-dir ./data/compose-ca-002 \
+  --project-name rpki-ca-experiment-002 \
+  --api-port 3001 \
+  --output ./data/experiments/compose-002
 ```
 
-警告：删除 `data/docker/ca` 会永久删除测试 CA 私钥、状态和所有已发布对象。`docker compose down --volumes` 不会删除 bind mount 中的数据。
-
-## HTTP API
-
-### 健康检查
+复用持久 CA 时，导出包包含该 CA 当前的**全部**已签对象，而不只包含本次 JSON 新增的对象。若只想执行完后停止容器，可加 `--down-after`；CA 数据仍会保留。更多参数见：
 
 ```bash
-curl http://localhost:3000/healthz
+bash scripts/experiment-compose.sh --help
 ```
 
-### 管理 ROA 授权
+## 流程 B：保留 CA，逐个签发并导出
+
+适合需要持续签发、更新输入、刷新发布材料的实验。下面使用同一个 CA 依次签发四类对象。
+
+### 1. 检查配置并创建 CA
 
 ```bash
-API_TOKEN="与 docker/.env 中 API_TOKEN 相同的值"
-
-curl --request POST http://localhost:3000/api/v1/roas \
-  --header "Authorization: Bearer ${API_TOKEN}" \
-  --header "Content-Type: application/json" \
-  --data '{
-    "added": [
-      { "asn": 64496, "prefix": "192.0.2.0/24", "max_length": 24, "comment": "production" },
-      { "asn": 64496, "prefix": "2001:db8::/48", "max_length": 48 }
-    ],
-    "removed": []
-  }'
+bash scripts/rpki-ca-docker.sh check-config --config examples/ca.toml
+bash scripts/rpki-ca-docker.sh init --dir ./data/my-ca --config examples/ca.toml
+bash scripts/rpki-ca-docker.sh ca-info --dir ./data/my-ca
 ```
 
-接口保存的是期望授权集合，实际 `.roa` 文件由 CA 自动派生。同一 ASN 的授权合并进一个 ROA；集合变化时旧 ROA 的 EE 证书被撤销，新 ROA、CRL 和 Manifest 在一次发布事务中提交。完全相同的授权再次加入会返回 `422 roa_delta_rejected`，并在 `details.duplicates` 中指出重复项，不会重新签发。
+初始化目录必须不存在或为空；已有 CA 直接用于后续签发，不要再次运行 `init`。
 
-查询当前授权及其实际发布对象：
+[examples/ca.toml](examples/ca.toml) 已配置 IP 资源 `192.0.2.0/24`、`2001:db8::/48` 和 ASN `64496`，以及 30 天的 CRL/Manifest 窗口，足以运行下面所有示例。可先复制并修改 TOML，再传入 `--config`。`--config` 与显式 CA 参数互斥，但可与 `--dir` 共用。
 
-```bash
-curl http://localhost:3000/api/v1/roas \
-  --header "Authorization: Bearer ${API_TOKEN}"
-```
+`ca-info` 无需私钥即可查看配置、实际证书 Subject/资源/URI、有效期和不一致提示；它是信息查看，不代替密码学验证。
 
-接口列表：
-
-- `GET /healthz`：健康检查，无需鉴权。
-- `GET /api/v1/roas`：列出期望 ROA 授权及其派生发布对象，要求 Bearer Token。
-- `POST /api/v1/roas`：原子应用 `{added, removed}` 授权增量；ROA 不使用 `Idempotency-Key`。
-- `GET /api/v1/aspas`：列出当前 ASPA 定义及实际发布对象。
-- `POST /api/v1/aspas`：原子应用 `{added, removed}` ASPA 批量增量；以 Customer ASN 为身份，重复提交是无操作，不使用 `Idempotency-Key`。
-- `GET /api/v1/aspas/{customer_asn}`：按 Customer ASN 查询当前 ASPA；`DELETE` 同一路径撤回 ASPA。
-- `GET /api/v1/toas`：列出当前 TOA 定义及实际发布对象。
-- `POST /api/v1/toas`：创建实验性 TOA；按规范化内容摘要去重，重复提交返回 `unchanged`，不使用 `Idempotency-Key`。
-- `GET /api/v1/toas/{key}`：按响应中的 64 位内容键查询当前 TOA；`DELETE` 同一路径撤回 TOA。
-- `GET /api/v1/toas/reviews`：列出已发布 TOA 的最近复核时间、下次截止时间和 ROA 覆盖状态。
-- `POST /api/v1/toas/{name}/reviews`：按 TOA 发布文件名重新检查其与当前 ROA 的覆盖关系并记录一次运行复核。
-- `GET /api/v1/sispis`：列出当前 SiSPI 定义及实际发布对象。
-- `POST /api/v1/sispis`：原子应用 `{added, removed}` SiSPI 批量增量；以 AS ID 为身份，重复提交是无操作，不使用 `Idempotency-Key`。
-- `GET /api/v1/sispis/{as_id}`：按 AS ID 查询当前 SiSPI；`DELETE` 同一路径撤回 SiSPI。
-- `DELETE /api/v1/signed-objects/{name}`：按当前 CA 签发清单中的发布文件名撤回 ASPA、TOA 或 SiSPI；ROA 必须通过授权增量移除，不能直接删除派生文件。
-- `GET /api/v1/repository/objects`：列出当前真实发布仓库中的证书、CRL、Manifest、ROA、ASPA、TOA 和 SiSPI，要求 Bearer Token。
-- `GET /api/v1/repository/objects/{name}`：严格解码仓库对象并返回结构化内容、SHA-256 和 Base64，要求 Bearer Token。
-- `GET /api/v1/repository/objects/{name}/validation`：使用 `rpki` 库从配置的 TAL 开始验证全部父级 CA 证书、CRL 和 Manifest，再验证当前 CA 发布点的 CRL、Manifest、文件哈希、吊销状态以及 ROA/ASPA/TOA/SiSPI 的 CMS、EE 证书、Profile 和资源覆盖。导入 RC 使用最近一次提交的父级发布快照，本接口不会主动通过 RRDP/rsync 下载更新。
-- `POST /api/v1/ca/validation-context`：更新导入 RC 的 TAL、父级证书、CRL 和 Manifest 本地快照；提交前会完整验证新路径并确认当前 CA 资源集合不变。
-- `GET /repository/{name}`：下载公开的 RPKI 仓库对象。
-
-对象详情接口的 `decoded` 不使用自定义的扁平字段名，而按对应 ASN.1 Profile 保留字段名和层级：证书按 RFC 6487 的证书字段与扩展展示；CRL 使用 `certificateList`、`revokedCertificates[].userCertificate/revocationDate` 和 `crlExtensions`；Manifest 使用 RFC 9286 的 `manifestNumber`、`thisUpdate`、`nextUpdate`、`fileHashAlg` 和 `fileList`；ROA、ASPA、TOA、SiSPI 的内容分别放在 `eContent` 中，并保留各自 RFC/Draft 定义的字段名。RFC 6488 的 CMS 外层统一放在 `cms` 中。`profile` 和 `summary` 是界面元数据，不属于对象 ASN.1 内容，因而与协议字段分开。
-
-管理层统一采用“对象定义/授权配置 → 调和 → 实际发布对象”的模型，而不是把仓库文件名当作业务身份。ROA 保存逐条授权配置并按 Origin ASN 派生 ROA；ASPA 以 Customer ASN、SiSPI 以 `asID` 作为稳定逻辑身份；TOA 使用规范化 eContent 的摘要作为身份。所有写接口都由后端按规范化后的领域状态去重，不使用 `Idempotency-Key`。相同 TOA 内容返回 `unchanged`；删除后可以直接重新创建。一批有效变更只生成一组 CRL/Manifest，并通过可恢复的发布事务原子切换。
-
-非 ROA 对象撤回成功后，API 返回对象类型和文件名、对象 EE 证书序列号、该证书是否因尚未过期而加入 CRL、撤销时间，以及新 CRL/Manifest 编号。例如：
-
-```bash
-curl --request DELETE \
-  "http://localhost:3000/api/v1/signed-objects/K2gN5Qx8Lc4sW9mT0pR7vY3aBzE.asa" \
-  --header "Authorization: Bearer ${API_TOKEN}"
-```
-
-```json
-{
-  "object_name": "K2gN5Qx8Lc4sW9mT0pR7vY3aBzE.asa",
-  "kind": "aspa",
-  "ee_certificate_serial": 10,
-  "ee_certificate_revoked": true,
-  "revocation_time": 1789460000,
-  "crl_number": 6,
-  "manifest_number": 6
-}
-```
-
-撤回会生成新的 CRL 和 Manifest：未过期的对象 EE 证书进入 CRL，对象不再出现在发布目录和新 Manifest 中，上一份 Manifest 的一次性 EE 证书同时被撤销。CA 证书、CRL 和 Manifest 不是此接口的合法目标。整个变更沿用可恢复的原子发布事务。
-
-CLI 也支持撤销，并在同一事务中更新 CRL 和 Manifest：
-
-```bash
-rpki-ca withdraw-aspa --dir data --customer-asn 64496
-rpki-ca withdraw-toa --dir data --object K2gN5Qx8Lc4sW9mT0pR7vY3aBzE.toa
-rpki-ca withdraw-sispi --dir data --as-id 64496
-```
-
-ROA 使用 `update-roas` 原子增删授权：
-
-```bash
-rpki-ca update-roas --dir data --delta /path/to/roa-delta.json
-rpki-ca list-roas --dir data
-```
-
-## CLI
-
-### 创建开发 TA
-
-```bash
-cargo run -- init \
-  --dir data \
-  --repository-uri rsync://localhost/rpki/ \
-  --name development-ca \
-  --development-ca-validity-days 365 \
-  --resource 192.0.2.0/24 \
-  --resource 2001:db8::/48
-```
-
-开发 TA 仅用于隔离测试，不属于公共 RPKI 信任链。
-
-### 直接传入 ROA 参数
-
-```bash
-cargo run -- sign-roa \
-  --dir data \
-  --asn 64496 \
-  --prefix 192.0.2.0/24 \
-  --prefix "2001:db8::/48,48" \
-  --output target/example.roa
-```
-
-`--prefix` 可以重复，每项支持以下两种形式：
+CA 目录包含需要保留的签发状态：
 
 ```text
-PREFIX
-PREFIX,MAX_LENGTH
+data/my-ca/
+├── ca.toml       # 配置
+├── ca.key        # CA 私钥，后续签发需要
+├── state.toml    # 序列号、对象和吊销等状态
+├── state.lock    # 并发访问锁
+└── repository/  # CA 管理的实际发布文件
 ```
 
-### 在 Compose 容器中运行 CLI
+请保留整个 CA 目录用于后续操作；分发实验材料时使用导出命令，不直接分发这个目录。
+
+### 2. 签发并导出单个 ROA
 
 ```bash
-docker compose -f docker/compose.yaml exec rpki-ca rpki-ca sign-roa \
-  --dir /var/lib/rpki/ca \
+bash scripts/rpki-ca-docker.sh sign-roa \
+  --dir ./data/my-ca \
   --asn 64496 \
   --prefix 192.0.2.0/24 \
-  --output /tmp/cli-example.roa
+  --prefix '2001:db8::/48,48' \
+  --output ./exports/roa-64496.roa
 ```
 
-### 刷新 CRL 和 Manifest
+`--prefix` 可以重复，格式为 `PREFIX` 或 `PREFIX,MAX_LENGTH`。省略最大长度时，只允许给出的前缀长度。Origin ASN 是授权对象，不要求 CA 持有该 ASN；IP 前缀必须由 CA 证书覆盖。
+
+也可以用 `sign-roa --request request.json` 代替 `--asn/--prefix`。请求结构为 `{"asn":64496,"prefixes":[{"prefix":"192.0.2.0/24","max_length":24}]}`。
+
+ROA 以授权集合管理，同 ASN 的授权合并为一个发布对象。重复加入已有授权会被拒绝；增删授权使用 `update-roas --delta`，查询使用 `list-roas`，而不是直接修改仓库文件。
+
+### 3. 签发并导出 ASPA
 
 ```bash
-cargo run -- refresh --dir data
-```
-
-生产调度器应在 Manifest `nextUpdate` 之前运行刷新命令。当前更新窗口为 24 小时，建议至少每 12 小时执行一次。
-
-### 签发 ASPA
-
-开发 TA 初始化时必须显式配置 Customer ASN 资源：
-
-```bash
-cargo run -- init \
-  --dir data \
-  --resource 192.0.2.0/24 \
-  --asn-resource 64496
-```
-
-签发 ASPA：
-
-```bash
-cargo run -- sign-aspa \
-  --dir data \
+bash scripts/rpki-ca-docker.sh sign-aspa \
+  --dir ./data/my-ca \
   --customer-asn 64496 \
   --provider-asn 64497 \
   --provider-asn 64498 \
-  --output target/aspa-64496.asa
+  --output ./exports/aspa-64496.asa
 ```
 
-HTTP 请求体格式：
+CA 必须持有 Customer ASN `64496`，不要求持有 Provider ASN。Provider 列表不能为空，不能包含 Customer 本身；当前实现会排序并去重。ASPA 的文件扩展名为 `.asa`。
 
-```json
-{
-  "customer_asn": 64496,
-  "provider_asns": [64497, 64498]
-}
-```
-
-Provider ASN 会按数值排序并去重；列表不能为空，Customer ASN 不能出现在 Provider 列表中，AS0 只能作为唯一 Provider。Customer ASN 必须由 CA 资源证书覆盖。
-
-### 签发 TOA
+### 4. 签发并导出 TOA
 
 ```bash
-cargo run -- sign-toa \
-  --dir data \
+bash scripts/rpki-ca-docker.sh sign-toa \
+  --dir ./data/my-ca \
   --asn 64496 \
   --asn 64497 \
   --prefix 192.0.2.0/24 \
   --prefix 2001:db8::/48 \
-  --output target/example.toa
+  --output ./exports/traffic-origin.toa
 ```
 
-HTTP 请求体为 `{"asns":[64496,64497],"prefixes":["192.0.2.0/24","2001:db8::/48"]}`。ASN 和前缀会按草案规范排序并去重；TOA EE 证书包含显式 IP Resources、禁止 inherit 且不包含 AS Resources。当前唯一非草案最终值是实验 OID `1.2.840.113549.1.9.16.1.999`。
+TOA 的 IP 前缀必须由 CA 覆盖；其中的 ASN 集合不是 CA 的 ASN 资源清单。TOA EE 使用 IP 资源。
 
-签发前会把 TOA 展开为全部 `(ASN, 前缀)` 组合，并按 ROA 的前缀和 `maxLength` 检查现有 ROA。若全部组合均被 ROA 覆盖，必须在 JSON 中提供非空的 `roa_overlap_justification`（CLI 使用 `--roa-overlap-justification`）才能按运行例外继续签发；部分重叠不会拆分对象，响应的 `advisories` 会说明覆盖数量，并按草案建议保留一个合并 TOA。签发时会记录首次复核，下次截止时间由 `TOA_REVIEW_DAYS` 决定。
+签发会检查 TOA 的 `(ASN, 前缀)` 组合与已有 ROA 的覆盖关系。上例还包含没有对应 ROA 的 ASN `64497`，属于部分重叠，可继续签发。若全部组合已被 ROA 覆盖，必须提供非空的 `--roa-overlap-justification '实验用途说明'`；JSON 请求中的对应字段放在 TOA 的 `definition` 内。部分重叠可能输出 `ADVISORY`，不表示签发失败。
 
-```bash
-rpki-ca list-toa-reviews --dir data
-rpki-ca review-toa \
-  --dir data \
-  --object K2gN5Qx8Lc4sW9mT0pR7vY3aBzE.toa \
-  --roa-overlap-justification "traffic origin 与 route origin 的运维职责不同"
-```
-
-对应 API 复核请求体为 `{"roa_overlap_justification":"运行原因"}`。若复核时 TOA 已被 ROA 完全覆盖而未提供理由，复核会被拒绝，提醒操作员更新或撤回 TOA。
-
-### 签发 SiSPI
-
-开发 TA 或导入 RC 必须持有 `asID` 对应的 ASN 资源。SiSPI 输入中的地址是可达的 SAVNET Agent 单播地址，不是由 EE 证书承载的资源：
+### 5. 签发并导出 SiSPI
 
 ```bash
-cargo run -- sign-sispi \
-  --dir data \
-  --as-id 64496 \
+bash scripts/rpki-ca-docker.sh sign-sispi \
+  --dir ./data/my-ca \
+  --asn 64496 \
   --address 192.0.2.1 \
   --address 2001:db8::1 \
-  --output target/sispi-64496.sav
+  --output ./exports/agent-64496.sav
 ```
 
-HTTP 请求体：
+CA 必须持有 `asn` 对应的 ASN。这里的地址是 SAVNET Agent 地址，不是 EE 证书中授权的 IP 资源；应填写地址而非前缀。SiSPI 的扩展名为 `.sav`。
 
-```json
-{
-  "as_id": 64496,
-  "addresses": ["192.0.2.1", "2001:db8::1"]
-}
+SiSPI 的 JSON、CA 状态、实验记录及 API 解码字段统一为 `asn`，签发、验证和撤回命令统一使用 `--asn`。不提供旧字段或旧参数的兼容入口；签名对象的 DER 编码保持不变。
+
+### 6. 理解单文件导出与真实发布名称
+
+每次 `sign-*` 都会先完成 CA 的本地签发/发布，再把对象字节写到 `--output`。终端会同时显示：
+
+```text
+... published as repository/<实际文件名>; exported to ./exports/<副本名>
 ```
 
-生成器按 IPv4、IPv6 和数值顺序规范化并去重地址。eContent 的 `version` 默认值 0 按 DER 要求省略；EE 证书仅包含覆盖 `asID` 的显式 AS Identifier Delegation Extension，禁止 `inherit`，且完全不包含 IP Address Delegation Extension。`.sav` 和 `application/rpki-sispi` 来自 SiSPI-06 草案；当前内容类型 OID `1.2.840.113549.1.9.16.1.998` 是本项目临时实验值，因为草案仍写作 TBD。
+`exports/` 中的名称是便于实验使用的副本名；真正写入 EE SIA、Manifest 和状态的发布文件名由 CA 管理。`--output` 不能放进 CA 的 `repository/`。示例使用 CA 目录之外的 `exports/`，避免与 CA 状态混放。
 
-## 导入已有 RC 或 TA
+**单对象输出路径已有文件时可能被覆盖；完整材料包的输出目录则不允许覆盖。** 不要为了统一名称而重命名材料包的 `repository/` 文件。使用完整验证流程时，应以真实发布名和对应 Manifest 为准。
 
-导入自签 TA：
+### 7. 导出完整公开快照
+
+四类对象签完后，把当前 CA 的已提交发布状态导出为一个材料包：
 
 ```bash
-cargo run -- import \
-  --dir data \
-  --certificate ta.cer \
-  --private-key ta.key \
-  --tal trust-anchor.tal \
-  --repository-uri rsync://rpki.example.net/repo/ta/ \
-  --certificate-uri rsync://rpki.example.net/repo/ta/ta.cer \
-  --serial-start 100000 \
-  --publication-number-start 1
+bash scripts/rpki-ca-docker.sh export-experiment \
+  --dir ./data/my-ca \
+  --output ./data/experiments/my-ca-snapshot-001
 ```
 
-非自签 RC 必须提供完整认证路径。`--chain-certificate` 按 TA 到直接父 CA 排序；每个签发 CA 都必须提供相同顺序的当前 CRL 和当前 Manifest。例如 `TA -> parent -> child`：
+输出必须是 CA 目录之外的新目录。
+
+快照导出会持有 CA 状态锁读取文件和清单，不需要私钥，不重新签发，也不延长有效期；不支持通过 `--valid-days` 修改现有材料的有效期。有未完成发布事务时拒绝导出，应先完成 CA 恢复。
+
+如果材料已经过期，快照仍可保存用于分析，但 `verification.json` 会记录验证失败，命令返回非零状态。这与一次性实验“先验证通过再提交新包”的行为不同。
+
+## 导出后如何使用与验证
+
+### 按实验目的选择材料
+
+| 实验内容 | 应使用的材料 |
+|---|---|
+| 读取 ASN、前缀、Agent 地址或分析 ASN.1/CMS 编码 | 对应 `.roa` / `.asa` / `.toa` / `.sav` 文件 |
+| 验证签名对象及本地发布集 | 整个导出包，包括 CA、CRL、Manifest 和 TAL |
+| 比较不同实验的输入和输出 | 对象内容及 `experiment.json`；不要只比较随机生成的签名字节 |
+| 再签发或刷新 | 原来的持久 CA 目录，公开材料包不能用于签发 |
+
+### 用本项目执行完整离线复验
+
+将整个材料包复制到实验机器，在该机器准备同版本 Docker 镜像，并把材料包放入项目挂载目录，然后执行：
 
 ```bash
-cargo run -- import \
-  --dir data \
-  --certificate child.cer \
-  --private-key child.key \
-  --tal trust-anchor.tal \
-  --repository-uri rsync://rpki.example.net/repo/child/ \
-  --certificate-uri rsync://rpki.example.net/repo/parent/child.cer \
-  --serial-start 100000 \
-  --publication-number-start 1 \
-  --chain-certificate ta.cer \
-  --chain-certificate parent.cer \
-  --chain-crl ta.crl \
-  --chain-crl parent.crl \
-  --chain-manifest ta.mft \
-  --chain-manifest parent.mft
+bash scripts/rpki-ca-docker.sh verify-experiment --dir ./data/experiments/my-ca-snapshot-001
+
+# 如已通过独立可信渠道保存 TAL，可以明确指定：
+bash scripts/rpki-ca-docker.sh verify-experiment \
+  --dir ./data/experiments/my-ca-snapshot-001 \
+  --tal ./data/trusted.tal
 ```
 
-导入会检查证书 Profile、有效期、私钥匹配、签名链、逐级解析后的资源、Manifest CMS/有效期、CRL 是否由证书 CRLDP 指定并由当前 Manifest 以匹配哈希列出、撤销状态，以及 SIA 发布地址。RFC 3779 `inherit` 会在认证路径上下文中解析并持久化。
+复验不读取原 CA 目录、不需要私钥、不联网。它重新检查文件清单与哈希、TAL/证书路径、当前时间有效性、CRL 吊销状态、Manifest、CMS 签名、EE Profile/资源，以及对象内容与包内预期输入是否一致。导入型 CA 还使用包内保存的上级证书、CRL 和 Manifest。
 
-导入时使用的 TAL、父级证书、CRL 和 Manifest 会随 CA 状态持久化。对象验证接口每次都会重新使用这些材料验证完整路径，而不是把导入的 RC 当作本地信任锚。父级 CRL/Manifest 更新后，应在旧快照到期前更新验证上下文；此操作不更换当前 RC 或私钥：
+成功输出 `status: "valid"`；失败返回非零退出码，并在 JSON 中提供 `error.code`、`error.object` 和原因。包内 `verification.json` 是导出时的历史记录，复验不会直接信任它，也不会覆盖它。
+
+默认信任包内 TAL 只说明该实验包在其自带信任锚下成立；不能证明它属于公共 RPKI。离线验证也无法获知导出后新发生的吊销或仓库更新。
+
+### 用 OpenSSL 交叉检查
 
 ```bash
-rpki-ca update-validation-context \
-  --dir data \
-  --tal trust-anchor.tal \
-  --chain-certificate ta.cer \
-  --chain-certificate parent.cer \
-  --chain-crl ta.crl \
-  --chain-crl parent.crl \
-  --chain-manifest ta.mft \
-  --chain-manifest parent.mft
+bash scripts/verify-experiment-docker.sh \
+  --dir ./data/experiments/my-ca-snapshot-001
 ```
 
-HTTP 入口为 `POST /api/v1/ca/validation-context`，请求字段是 `tal_base64`、`chain_base64`、`crls_base64` 和 `manifests_base64`。后端只在新快照能够验证当前 RC 且解析后的资源集合不变时保存；失败时继续保留原快照。
+此脚本在工具容器中使用 Python 检查清单/哈希，并调用 OpenSSL 检查对象与 Manifest 的 CMS 签名；宿主机无需安装这些工具。
 
-`serial-start` 必须是该 CA 从未使用过的下一个证书序列号。`publication-number-start` 同时作为首个 CRL Number 和 Manifest Number；当前版本只接受新签发且从未发布对象的 RC，因此该值必须是 1。完整接管一个已有发布历史的 CA 还需要迁移其对象清单和撤销状态，不能只复制证书与私钥。
+它**不检查**完整证书路径、吊销、有效期、资源授权或对象预期内容，不能代替上一节的主验证器；输出会明确给出检查范围。
 
-仅从 APNIC 等 RIR 公共仓库下载证书和对象，通常无法获得对应 CA 私钥，因此不能直接用下载内容冒充该 RC 签发新 ROA；实际签发必须使用由上级分配给你的资源证书和你自己控制的匹配私钥。
+### 材料包中的实验记录
 
-## 资源与输入语义
+新包使用格式 v4，当前验证器也支持 v1/v2/v3（字段名须符合当前 ASN 定义）；旧版验证器需升级后才能读取 v4。
 
-- `CA_RESOURCES` 或 `init --resource`：开发 TA 证书持有的 IP 资源上限。
-- ROA `asn`：被授权宣告路由的 Origin ASN，不是用来签名的 CA 身份。
-- ROA `prefixes`：准备授权给该 Origin ASN 的 IP 前缀。
-- `max_length`：允许的最具体路由长度；省略时只允许 ROA 中给出的前缀长度。
-- CA 私钥：签名所必需，不能从 RIR 公共仓库下载获得。
-- RC 证书：决定 CA 可以授权的资源范围。
+| `experiment.json` 字段 | 内容 |
+|---|---|
+| `source` / `request` | 新建实验或现有 CA 快照；新建实验保存请求，快照的 `request` 为 null |
+| `objects` / `profiles` | 实际发布名与对象定义、当前实现的 Profile 版本和 OID |
+| `files` / `repository_sha256` | URI、哈希、大小、有效期、EE 与 CMS 信息 |
+| `files.<文件名>.decoded` | 从该文件 DER 字节解码的实际内容，与 API 对象详情的 `decoded` 使用同一解码器 |
+| `ca_metadata.certificate` | 从证书解析的 CA Subject、Issuer、SKI、资源、URI、有效期 |
+| `ca_metadata.configuration` | 导出时公开配置摘要，与证书实际字段分开 |
+| `parent_context` / `parent_materials` | 上级验证字节与可读有效期摘要；自建 TA 没有上级材料 |
 
-程序会拒绝空前缀集合、带主机位的网络、无效 `maxLength`，以及任何不被 CA 证书覆盖的 IP 前缀。签发前会按 RFC 9582 对前缀排序、去重，并省略与前缀长度相同的冗余 `maxLength`；ASN 0 按 RFC 9582 的 ASN.1 范围允许编码。
+v4 为仓库中的每个文件保存解码结果，包括 CA 证书、CRL、Manifest 及四类签名对象。签名对象的 `decoded.eContent` 是实际载荷，`decoded.cms` 提供 CMS 结构和内嵌 EE 证书信息；`objects` 中的 `definition` 仍是预期对象定义，两者分别保留。
 
-## 文件和发布
+复验会重新解码原始文件并核对 `decoded`；v4 缺失或修改解码结果会返回 `metadata` 错误。配置摘要本身没有数字签名，不代表历史对象按当前配置签发，也不能单独证明材料来源。完整说明见 [离线对象实验](docs/offline-experiments.md)。
 
-本地仓库位于 `<CA_DIR>/repository`，包含：
+## 有效期、刷新与重新导出
 
-- `<ca-key-id>.cer`：CA 资源证书。
-- `<ca-key-id>.crl`：当前 CRL。
-- `<ca-key-id>.mft`：当前 Manifest。
-- `<ee-key-id>.roa`：已签发 ROA。
-- `<ee-key-id>.asa`：已签发 ASPA。
-- `<ee-key-id>.toa`：已签发实验性 TOA。
-- `<ee-key-id>.sav`：已签发实验性 SiSPI。
+| 创建方式 | CRL/Manifest 初始策略 |
+|---|---|
+| 一次性 `experiment` | 默认 30 天，无随机偏移，可用 `valid_days` 或 `--valid-days` 调整 |
+| 本文 `init --config examples/ca.toml` | 示例文件显式设为 720 小时，即 30 天，无随机偏移 |
+| 不提供配置的普通 `init` | 默认 24 小时，加 0～4 小时随机偏移 |
+| `export-experiment` 快照 | 保留原材料时间，不重新计时 |
 
-所有 `<key-id>` 都采用 RFC 6481 推荐名称：对应公钥的 160 位 Key Identifier 使用 RFC 4648 URL/filename-safe Base64 编码并移除填充，结果固定为 27 个字符。ROA/ASPA 每次重签会生成新的一次性 EE 密钥，因此文件名也随之更新；状态、证书 SIA、Manifest 条目和实际文件会在同一发布事务中切换。CA 使用同一密钥续期时 CA/CRL/Manifest 名称保持稳定。导入非自签 RC 时，CA 证书名称仍以父 CA 发布的 `certificate_uri` 为准，系统不会擅自重命名父 CA 管理的对象。
+默认新建 CA 证书寿命为 365 天，对象 EE 默认 52 周且不会超过 CA 到期时间。修改配置不会延长已签出的对象。报告里的 `publication_valid_until` 是本地 Manifest 的截止时间，不一定是整个证书链的最早失效时间。
 
-CLI 的 `--output` 只是导出一份对象副本，必须位于 `<CA_DIR>/repository` 之外；发布仓库内的推荐名称由 CA 独占管理。
-
-发布时先构造完整 staging 仓库，再进行目录级切换；失败时恢复旧仓库，启动时也会恢复中断留下的备份。这不是 RFC 8181 Publication Server，实现远程发布时仍需接入独立的 RFC 8181 服务。
-
-## 开发检查
+保留 CA 的情况下，可以刷新发布材料，再导出一个新快照：
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+bash scripts/rpki-ca-docker.sh certificate-status --dir ./data/my-ca
+bash scripts/rpki-ca-docker.sh refresh --dir ./data/my-ca
+bash scripts/rpki-ca-docker.sh export-experiment \
+  --dir ./data/my-ca \
+  --output ./data/experiments/my-ca-snapshot-002
 ```
 
-### Docker Compose 端到端测试
+`refresh` 更新 CRL/Manifest，不是 CA 换证或对象 EE 续期；CA、对象 EE 和导入链材料也必须有效。按实际 `nextUpdate` 安排刷新。一次性实验已删除私钥，无法刷新旧包，需要重新运行流程 A 生成新包。
 
-测试的 Compose 参数、CA 资源以及所有签名对象输入统一定义在 `tests/e2e/config.sh`。启动和清理由所有对象测试复用。
+到期的文件仍可用于纯解析实验，但不能再声称它们通过了当前时间的完整验证。更换证书和更新上级验证上下文见 [CA 生命周期](docs/ca-lifecycle.md)与[导入 CA](docs/import-ca.md)。
 
-默认一次启动 Compose 并依次测试 ROA、ASPA、TOA 和 SiSPI：
+## 通过 Krill 发布到远程仓库
+
+需要在线仓库时，先按 [Krill 接入指南](docs/krill-publication.md) 部署发布服务、注册独立 BPKI 身份，再使用返回的发布地址配置持久 CA。原有签发和本地导出流程继续使用本地仓库；远程同步通过 `publisher` CLI 显式执行。
+
+例如，已按指南创建 `data/krill/ca` 和 `data/krill/publisher` 后：
+
+```bash
+bash scripts/rpki-ca-docker.sh publisher sync \
+  --publisher-dir data/krill/publisher --dir data/krill/ca \
+  --tls-ca docker/krill/tls/ca.crt --dry-run
+
+bash scripts/rpki-ca-docker.sh publisher sync \
+  --publisher-dir data/krill/publisher --dir data/krill/ca \
+  --tls-ca docker/krill/tls/ca.crt
+```
+
+签发、撤回、刷新或换证后重新同步。每个 CA 使用独立 publisher；本地写入成功与远端同步成功是两个状态，HTTP API 和 Compose 实验脚本不会自动发布到 Krill。一次性实验包已删除私钥，后续发布应使用持久 CA。自签 CA 仍需向验证器提供可信 TAL，TOA/SiSPI 仍需相应实验解析支持。
+
+## 常见问题
+
+| 现象 | 处理方式 |
+|---|---|
+| Docker 镜像尚未构建 | 执行准备环境中的镜像构建命令；使用 `--no-build` 前确保运行和工具镜像均已存在 |
+| CA 或材料包输出目录已存在 | 使用已有 CA 继续签发；新建 CA/材料包请选择新目录 |
+| ASPA/SiSPI 报 ASN 越权 | 检查 CA 实际证书是否持有 Customer ASN / AS ID；仅修改配置不会增加证书资源 |
+| ROA/TOA 报 IP 越权 | 检查前缀是否在 CA 证书资源内，以及是否有主机位 |
+| 重复提交 ROA 授权被拒绝 | 用 `list-roas` 检查当前集合，再通过 `update-roas` 增删 |
+| TOA 因 ROA 全覆盖被拒绝 | 提供具体的重叠例外理由，或调整实验输入 |
+| 验证返回 `not_yet_valid` | 检查系统时间；连续发布的时间戳可能短暂领先，稍后重试 |
+| 验证返回 `expired` | 检查具体到期文件，刷新/更新相应材料后重新导出，或重新生成实验包 |
+| 单对象副本写入失败 | 签发可能已经完成，先检查 CA 当前发布状态，避免直接重复提交同一请求 |
+| 快照导出返回非零但目录已生成 | 查看目录中的 `verification.json`，导出的原材料可能已过期或验证失败 |
+| 想让证书显示 CA 的可读名称 | `name` 只是本地标签；当前 Subject 按公钥生成，不提供自定义 CN |
+| 本地签发成功但 Krill 没有更新 | 使用已注册 publisher 执行 `publisher sync`；检查发布地址是否匹配、TLS 信任和远端响应 |
+
+## 其他入口与开发文档
+
+本项目实现的对象版本如下，表示代码所支持的版本，不声称是最新标准或草案：
+
+| 对象 | 扩展名 | 实现的 Profile |
+|---|---|---|
+| ROA | `.roa` | RFC 9582 |
+| ASPA | `.asa` | draft-ietf-sidrops-aspa-profile-29 |
+| TOA | `.toa` | draft-qin-savnet-toa-02；实验 OID `1.2.840.113549.1.9.16.1.999` |
+| SiSPI | `.sav` | draft-chen-sidrops-sispi-06；实验 OID `1.2.840.113549.1.9.16.1.998` |
+
+需要常驻接口时可使用 `serve` 或 Docker Compose，CLI 与 HTTP API 共用 CA 核心。详细内容单独维护：
+
+- [CA 配置与信息查看](docs/ca-configuration.md)
+- [离线实验、验证范围与元数据](docs/offline-experiments.md)
+- [HTTP API、对象查询与撤回](docs/http-api.md)
+- [导入资源证书与更新上级材料](docs/import-ca.md)
+- [CA 生命周期与换证](docs/ca-lifecycle.md)
+- [Docker Compose](docs/docker-compose.md)
+- [Krill 发布仓库功能与接入指南](docs/krill-publication.md)
+- [架构与调用链](docs/architecture.md)
+
+`src/main.rs` 是唯一 crate 入口；`cli`、`api` 为接口层，`application` 编排用例，`ca` 处理签发，`infrastructure` 管理存储和签名，`validation` 负责验证，`experiment` 负责实验包。默认提供本地发布仓库；可通过新增 `publisher` 命令显式同步到 [Krill Publication Server](docs/krill-publication.md)，不影响原有本地和离线流程。
+
+本机源码开发检查单独列在 [开发文档](docs/development.md)，不属于 Docker 运行的准备步骤。
+
+Docker 端到端测试需要 Docker Compose，输入集中在 `tests/e2e/config.sh`：
 
 ```bash
 bash tests/e2e/0_run.sh
-```
-
-也可以只测试一种对象，方便定位问题：
-
-```bash
-bash tests/e2e/0_run.sh roa
-bash tests/e2e/0_run.sh aspa
+# 也可单独指定 roa、aspa、toa 或 sispi：
 bash tests/e2e/0_run.sh toa
-bash tests/e2e/0_run.sh sispi
 ```
 
-`all` 模式只构建和启动一次容器，随后分别执行四种对象的签发、下载、密码学验证和 API 幂等测试，最后统一清理；因此它适合作为日常完整回归和 CI 默认入口。单对象模式使用同一套启动和清理代码，适合开发过程中快速定位问题。
-
-完整流程会构建并启动专用 Compose 环境、初始化测试 CA、等待 API、依次提交固定对象请求、下载发布结果、在容器内执行密码学与发布集验证、验证 API 幂等性，最后自动删除测试容器、网络、数据卷和临时文件。任一步失败时，会先打印容器日志再清理，并以非零状态退出。默认使用宿主机端口 `3100`；可通过 `RPKI_CA_E2E_PORT` 临时修改。
-
-正常执行时会隐藏 Docker 构建和资源创建的详细输出，只显示测试步骤、输入、关键结果及 `PASS`。完整 Compose 构建输出保存在测试临时目录中，仅在构建或启动失败时打印。脚本使用兼容旧版本的 `curl --fail`。
-
-更多文档：
-
-- [架构与调用链](docs/architecture.md)
-- [Docker Compose 与 API](docs/docker-compose.md)
-- [CA 功能验收测试](docs/ca-testing.md)
-
-## CA 证书生命周期
-
-`CA_RENEW_BEFORE_DAYS`（默认 30 天）定义 CA 证书到期预警窗口。API 服务每次执行定时发布检查时也会检查证书有效期，并在进入窗口后输出告警。可以通过 CLI 或 HTTP API 随时读取状态：
-
-```bash
-rpki-ca certificate-status --dir data
-
-curl http://localhost:3000/api/v1/ca/certificate \
-  --header "Authorization: Bearer ${API_TOKEN}"
-```
-
-当前 CA 证书实际授权的 ASN、IPv4 和 IPv6 资源可以通过只读接口查询：
-
-```bash
-curl http://localhost:3000/api/v1/ca/resources \
-  --header 'Authorization: Bearer change-me'
-```
-
-返回格式与 Krill CA 详情中的资源摘要一致，例如
-`{"asn":"AS64496","ipv4":"192.0.2.0/24","ipv6":"2001:db8::/48"}`。
-该接口展示后端已解析并用于签发授权检查的真实资源，不允许绕过上级 CA
-证书直接扩大资源范围。
-
-续期操作只接受父 CA 为当前密钥新签发的 DER 证书。新证书必须保持主体、公钥、资源集合和发布 URI 不变，并且 `notAfter` 必须晚于当前证书。非自签 RC 仍需提供从 TA 到直接父 CA 的完整证书链，以及每级当前 CRL 和 Manifest：
-
-```bash
-rpki-ca renew-certificate \
-  --dir data \
-  --certificate renewed-child.cer \
-  --tal trust-anchor.tal \
-  --chain-certificate ta.cer \
-  --chain-certificate parent.cer \
-  --chain-crl ta.crl \
-  --chain-crl parent.crl \
-  --chain-manifest ta.mft \
-  --chain-manifest parent.mft
-```
-
-HTTP 入口为 `POST /api/v1/ca/certificate-renewals`，字段为 `certificate_base64`、`tal_base64`、`chain_base64`、`crls_base64` 和 `manifests_base64`；后三项为数组。服务成功后返回 `204 No Content`。例如自签开发 TA 的请求体可生成如下：
-
-```bash
-jq -n \
-  --arg certificate "$(base64 < renewed-ta.cer | tr -d '\n')" \
-  --arg tal "$(base64 < trust-anchor.tal | tr -d '\n')" \
-  '{certificate_base64: $certificate, tal_base64: $tal}' > renewal.json
-
-curl --request POST http://localhost:3000/api/v1/ca/certificate-renewals \
-  --header "Authorization: Bearer ${API_TOKEN}" \
-  --header "Content-Type: application/json" \
-  --data @renewal.json
-```
-
-续期会在同一个可恢复发布事务中替换当前 `<key-id>.cer` 并重签 `<key-id>.crl` 和 `<key-id>.mft`；同密钥、同资源条件下名称不变，已有 ROA/ASPA 保持有效。更换 CA 密钥不属于本操作，必须通过 RFC 6489 的双密钥 key-roll 状态机完成，目前尚未实现。
+端到端脚本创建并清理专用测试环境，默认使用宿主机端口 3100，可用 `RPKI_CA_E2E_PORT` 覆盖。它会签发、下载并验证对象，适合修改 HTTP API 后检查完整服务流程。

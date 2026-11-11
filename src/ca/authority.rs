@@ -11,7 +11,7 @@ use crate::{
     CaValidationContextUpdate, CertifiedResources, CertifiedResourcesView, ObjectDefinition,
     ObjectDeltaResponse, ObjectKind, ObjectWithdrawal, RoaConfiguration, RoaConfigurationView,
     RoaDelta, RoaDeltaError, RoaDeltaRejected, RoaDeltaResponse, RoaPayload, RoaRequest,
-    SispiDelta, SispiRequest, ToaRequest, ToaReviewStatus,
+    SispiDelta, SispiRequest, ToaDelta, ToaRequest, ToaReviewStatus,
 };
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -402,6 +402,20 @@ impl CertificateAuthority {
         )
     }
 
+    /// Atomically applies a naturally idempotent batch of complete TOAs.
+    pub fn update_toas(&self, delta: ToaDelta) -> Result<ObjectDeltaResponse> {
+        let mut removed = Vec::with_capacity(delta.removed.len());
+        for request in delta.removed {
+            request.validate()?;
+            removed.push(ObjectDefinition::Toa(request.canonicalized()).logical_key());
+        }
+        self.update_stable_objects(
+            ObjectKind::Toa,
+            delta.added.into_iter().map(ObjectDefinition::Toa).collect(),
+            removed,
+        )
+    }
+
     fn update_stable_objects(
         &self,
         kind: ObjectKind,
@@ -431,28 +445,60 @@ impl CertificateAuthority {
         let resources = state.certified_resources()?.clone();
         let mut result = ObjectDeltaResponse::default();
         let mut pending_validated = Vec::new();
+        let mut toa_roa_index = None;
 
         // Validate the complete batch before allocating serials or changing state.
         for (key, definition) in additions {
             let current = state.signed_object(&key);
-            if current.as_ref().and_then(|item| item.definition.as_ref()) == Some(&definition) {
+            let unchanged = if kind == ObjectKind::Toa {
+                // TOA identity is its canonical eContent. Operational review
+                // metadata is deliberately excluded from that identity.
+                current.is_some()
+            } else {
+                current.as_ref().and_then(|item| item.definition.as_ref()) == Some(&definition)
+            };
+            if unchanged {
                 result.unchanged.push(key);
                 continue;
             }
             let requested_name = match &definition {
                 ObjectDefinition::Aspa(value) => format!("aspa-AS{}.asa", value.customer_asn),
-                ObjectDefinition::Sispi(value) => format!("sispi-AS{}.sav", value.as_id),
+                ObjectDefinition::Sispi(value) => format!("sispi-AS{}.sav", value.asn),
+                ObjectDefinition::Toa(_) => format!("toa-{}.toa", &key[4..28]),
                 _ => unreachable!("kind checked above"),
             };
             Self::validate_signed_object_filename(&requested_name, kind.extension())?;
             let validated =
                 Self::validate_publication(definition, &requested_name, resources.clone())?;
             if current.is_some() {
-                result.updated.push(key);
+                result.updated.push(key.clone());
             } else {
-                result.created.push(key);
+                result.created.push(key.clone());
             }
-            pending_validated.push(validated);
+            let (advisories, toa_review) = match &validated.definition {
+                ObjectDefinition::Toa(request) => {
+                    // Load lazily: unchanged and removal-only batches need no
+                    // ROA reads. All new TOAs share this locked snapshot.
+                    if toa_roa_index.is_none() {
+                        toa_roa_index = Some(super::toa_policy::ToaRoaIndex::load(
+                            self.repository.as_ref(),
+                            &state.published_names(ObjectKind::Roa),
+                        )?);
+                    }
+                    let assessment = toa_roa_index
+                        .as_ref()
+                        .expect("index loaded")
+                        .evaluate(request);
+                    let advisories = assessment.enforce(request)?;
+                    let review = self.toa_review(&assessment, request, &advisories)?;
+                    (advisories, Some(review))
+                }
+                _ => (Vec::new(), None),
+            };
+            if !advisories.is_empty() {
+                result.advisories.insert(key, advisories);
+            }
+            pending_validated.push((validated, toa_review));
         }
 
         let now = Utc::now().timestamp();
@@ -487,7 +533,7 @@ impl CertificateAuthority {
         let crl_uri = base.join(self.crl_filename(&cert).as_bytes())?;
         let validity = self.object_validity(&cert, kind)?;
         let mut pending = Vec::new();
-        for (mut validated, serial) in pending_validated
+        for ((mut validated, toa_review), serial) in pending_validated
             .into_iter()
             .zip(&numbers.object_ee_serials)
         {
@@ -512,7 +558,7 @@ impl CertificateAuthority {
                     serial: *serial,
                     not_after: validity.not_after().timestamp(),
                 },
-                toa_review: None,
+                toa_review,
             });
         }
         self.publish(&mut state, numbers, pending, withdrawal_names, None)?;
@@ -636,8 +682,8 @@ impl CertificateAuthority {
         self.withdraw_by_published_name(object_name, "toa")
     }
 
-    pub fn withdraw_sispi(&self, as_id: u32) -> Result<bool> {
-        self.withdraw_logical(&format!("sispi:AS{as_id}"))
+    pub fn withdraw_sispi(&self, asn: u32) -> Result<bool> {
+        self.withdraw_logical(&format!("sispi:AS{asn}"))
     }
 
     fn withdraw_by_published_name(&self, object_name: &str, extension: &str) -> Result<bool> {
@@ -1375,6 +1421,9 @@ impl CertificateAuthority {
         cert.set_basic_ca(Some(true));
         cert.set_ca_repository(Some(base.clone()));
         cert.set_rpki_manifest(Some(base.join(manifest_name.as_bytes())?));
+        if let Some(uri) = &self.config.rrdp_notification_uri {
+            cert.set_rpki_notify(Some(uri.parse()?));
+        }
         let v4: Vec<_> = self
             .config
             .development_resources

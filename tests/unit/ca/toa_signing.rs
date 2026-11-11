@@ -4,6 +4,63 @@ use rpki::repository::{cert::Cert, tal::TalInfo};
 use std::fs;
 
 #[test]
+fn batch_adds_replays_and_removes_complete_toas_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = crate::CaManager::init(dir.path(), CaConfig::default()).unwrap();
+    let first = ToaRequest {
+        asns: vec![64497, 64496],
+        prefixes: vec!["192.0.2.0/24".parse().unwrap()],
+        roa_overlap_justification: None,
+    };
+    let second = ToaRequest {
+        asns: vec![64500],
+        prefixes: vec!["2001:db8::/48".parse().unwrap()],
+        roa_overlap_justification: None,
+    };
+    let delta = crate::ToaDelta {
+        added: vec![first.clone(), second.clone()],
+        removed: vec![],
+    };
+
+    let created = ca.update_toas(delta.clone()).unwrap();
+    assert_eq!(created.created.len(), 2);
+    assert_eq!(created.objects.len(), 2);
+    let names: Vec<_> = created
+        .objects
+        .iter()
+        .map(|object| object.object_name.clone())
+        .collect();
+
+    let replay = ca.update_toas(delta).unwrap();
+    assert_eq!(replay.unchanged.len(), 2);
+    assert_eq!(
+        replay
+            .objects
+            .iter()
+            .map(|object| object.object_name.clone())
+            .collect::<Vec<_>>(),
+        names
+    );
+
+    let removed = ca
+        .update_toas(crate::ToaDelta {
+            added: vec![],
+            removed: vec![first],
+        })
+        .unwrap();
+    assert_eq!(removed.removed.len(), 1);
+    assert_eq!(removed.objects.len(), 1);
+    assert_eq!(
+        removed.objects[0]
+            .definition
+            .as_ref()
+            .unwrap()
+            .logical_key(),
+        ObjectDefinition::Toa(second).canonicalized().logical_key()
+    );
+}
+
+#[test]
 fn signs_and_validates_draft_toa_publication() {
     let dir = tempfile::tempdir().unwrap();
     let ca = crate::CaManager::init(dir.path(), CaConfig::default()).unwrap();
@@ -80,18 +137,22 @@ fn enforces_roa_overlap_exception_and_tracks_periodic_review() {
 
     let mut allowed = request;
     allowed.roa_overlap_justification = Some("separate traffic-origin workflow".into());
-    let output = ca
-        .sign_object(ObjectDefinition::Toa(allowed), "traffic-origin.toa")
+    let response = ca
+        .update_toas(crate::ToaDelta {
+            added: vec![allowed],
+            removed: vec![],
+        })
         .unwrap();
-    assert_eq!(output.advisories.len(), 1);
+    assert_eq!(response.advisories.values().next().unwrap().len(), 1);
+    let object_name = response.objects[0].object_name.clone();
     let statuses = ca.toa_review_statuses().unwrap();
     assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].object_name, output.name);
+    assert_eq!(statuses[0].object_name, object_name);
     assert!(!statuses[0].overdue);
     assert_eq!(statuses[0].roa_covered_pairs, 1);
-    assert!(ca.review_toa(&output.name, None).is_err());
+    assert!(ca.review_toa(&object_name, None).is_err());
     assert!(
-        ca.review_toa(&output.name, Some("reviewed exception".into()))
+        ca.review_toa(&object_name, Some("reviewed exception".into()))
             .is_ok()
     );
 }

@@ -26,8 +26,17 @@ pub fn verify_roa_publication(
     let repository = LocalRepository::new(ca_dir);
     let state = LocalStateStore::new(ca_dir).load()?;
     let publication = PublicationSet::load(&repository, state.validation_context())?;
-    let path = ca_dir.join("repository").join(roa_name);
-    let roa = Roa::decode(std::fs::read(&path)?.as_slice(), true)?;
+    verify_roa_set(&publication, roa_name, expected_asn, expected_payloads)
+}
+
+pub(crate) fn verify_roa_set(
+    publication: &PublicationSet,
+    roa_name: &str,
+    expected_asn: u32,
+    expected_payloads: &[String],
+) -> Result<Vec<String>> {
+    validate_name(roa_name, "roa")?;
+    let roa = Roa::decode(publication.object_bytes(roa_name)?.as_slice(), true)?;
     let bytes = publication.validate_object(roa_name, roa.cert(), "roa")?;
     let roa = Roa::decode(bytes.as_slice(), true)?;
     let (_, content) = roa
@@ -70,8 +79,17 @@ pub fn verify_aspa_publication(
     let repository = LocalRepository::new(ca_dir);
     let state = LocalStateStore::new(ca_dir).load()?;
     let publication = PublicationSet::load(&repository, state.validation_context())?;
-    let path = ca_dir.join("repository").join(aspa_name);
-    let aspa = Aspa::decode(std::fs::read(&path)?.as_slice(), true)?;
+    verify_aspa_set(&publication, aspa_name, customer_asn, expected_providers)
+}
+
+pub(crate) fn verify_aspa_set(
+    publication: &PublicationSet,
+    aspa_name: &str,
+    customer_asn: u32,
+    expected_providers: &[u32],
+) -> Result<Vec<String>> {
+    validate_name(aspa_name, "asa")?;
+    let aspa = Aspa::decode(publication.object_bytes(aspa_name)?.as_slice(), true)?;
     let bytes = publication.validate_object(aspa_name, aspa.cert(), "asa")?;
     let aspa = Aspa::decode(bytes.as_slice(), true)?;
     let (_, content) = aspa
@@ -108,8 +126,17 @@ pub fn verify_toa_publication(
     let repository = LocalRepository::new(ca_dir);
     let state = LocalStateStore::new(ca_dir).load()?;
     let publication = PublicationSet::load(&repository, state.validation_context())?;
-    let path = ca_dir.join("repository").join(toa_name);
-    let toa = Toa::decode(std::fs::read(&path)?.into())?;
+    verify_toa_set(&publication, toa_name, expected_asns, expected_prefixes)
+}
+
+pub(crate) fn verify_toa_set(
+    publication: &PublicationSet,
+    toa_name: &str,
+    expected_asns: &[u32],
+    expected_prefixes: &[ipnet::IpNet],
+) -> Result<Vec<String>> {
+    validate_name(toa_name, "toa")?;
+    let toa = Toa::decode(publication.object_bytes(toa_name)?.into())?;
     let bytes = publication.validate_object(toa_name, toa.cert(), "toa")?;
     let toa = Toa::decode(bytes.into())?;
     let (_, content) = toa
@@ -155,22 +182,31 @@ pub fn verify_toa_publication(
 pub fn verify_sispi_publication(
     ca_dir: &Path,
     sispi_name: &str,
-    expected_as_id: u32,
+    expected_asn: u32,
     expected_addresses: &[IpAddr],
 ) -> Result<Vec<String>> {
     validate_name(sispi_name, "sav")?;
     let repository = LocalRepository::new(ca_dir);
     let state = LocalStateStore::new(ca_dir).load()?;
     let publication = PublicationSet::load(&repository, state.validation_context())?;
-    let path = ca_dir.join("repository").join(sispi_name);
-    let sispi = Sispi::decode(std::fs::read(&path)?.into())?;
+    verify_sispi_set(&publication, sispi_name, expected_asn, expected_addresses)
+}
+
+pub(crate) fn verify_sispi_set(
+    publication: &PublicationSet,
+    sispi_name: &str,
+    expected_asn: u32,
+    expected_addresses: &[IpAddr],
+) -> Result<Vec<String>> {
+    validate_name(sispi_name, "sav")?;
+    let sispi = Sispi::decode(publication.object_bytes(sispi_name)?.into())?;
     let bytes = publication.validate_object(sispi_name, sispi.cert(), "sav")?;
     let sispi = Sispi::decode(bytes.into())?;
     let (_, content) = sispi
         .process(&publication.ca, |_| Ok(()))
         .map_err(|error| anyhow::anyhow!("SiSPI validation failed: {error}"))?;
     ensure!(
-        content.as_id() == Asn::from(expected_as_id),
+        content.asn() == Asn::from(expected_asn),
         "SiSPI AS ID mismatch"
     );
     let expected_v4 = expected_addresses
@@ -204,7 +240,7 @@ pub fn verify_sispi_publication(
     );
     Ok(vec![
         "CA certificate, current CRL, and current Manifest valid".into(),
-        format!("SiSPI CMS, profile, AS{expected_as_id}, and SAVNET Agent addresses valid"),
+        format!("SiSPI CMS, profile, AS{expected_asn}, and SAVNET Agent addresses valid"),
         "Manifest: complete file hashes and selected CRL valid".into(),
     ])
 }

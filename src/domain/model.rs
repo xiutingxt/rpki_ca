@@ -2,7 +2,7 @@ use crate::{AspaRequest, RoaRequest, SispiRequest, ToaRequest};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,7 +86,7 @@ impl ObjectDefinition {
         match self {
             Self::Roa(request) => format!("roa:AS{}", request.asn),
             Self::Aspa(v) => format!("aspa:AS{}", v.customer_asn),
-            Self::Sispi(v) => format!("sispi:AS{}", v.as_id),
+            Self::Sispi(v) => format!("sispi:AS{}", v.asn),
             Self::Toa(request) => {
                 // Operational review metadata is not part of the TOA eContent
                 // and therefore must not create a second logical object.
@@ -117,6 +117,7 @@ pub struct ObjectDeltaResponse {
     pub updated: Vec<String>,
     pub removed: Vec<String>,
     pub unchanged: Vec<String>,
+    pub advisories: BTreeMap<String, Vec<String>>,
     pub objects: Vec<SignedObjectView>,
 }
 

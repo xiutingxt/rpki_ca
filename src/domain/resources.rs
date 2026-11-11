@@ -94,10 +94,10 @@ impl CertifiedResources {
     }
 
     pub fn authorizes_sispi(&self, request: &SispiRequest) -> Result<()> {
-        if !self.resources.contains_asn(request.as_id.into()) {
+        if !self.resources.contains_asn(request.asn.into()) {
             return Err(ResourceAuthorizationError(format!(
                 "无法签发 SiSPI：AS{} 不在当前 CA 证书授权的 ASN 资源范围内",
-                request.as_id
+                request.asn
             ))
             .into());
         }

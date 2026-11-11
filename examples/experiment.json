@@ -1,0 +1,31 @@
+{
+  "ca": {
+    "name": "offline-experiment",
+    "repository_uri": "rsync://localhost/rpki/",
+    "development_ca_validity_days": 365,
+    "ca_renew_before_days": 30,
+    "roa_valid_weeks": 52,
+    "aspa_valid_weeks": 52,
+    "toa_valid_weeks": 52,
+    "sispi_valid_weeks": 52
+  },
+  "valid_days": 30,
+  "resources": ["192.0.2.0/24", "2001:db8::/48"],
+  "asn_resources": [64496],
+  "objects": [
+    {
+      "kind": "toa",
+      "definition": {
+        "asns": [64496, 64497],
+        "prefixes": ["192.0.2.0/24", "2001:db8::/48"]
+      }
+    },
+    {
+      "kind": "sispi",
+      "definition": {
+        "asn": 64496,
+        "addresses": ["192.0.2.1", "2001:db8::1"]
+      }
+    }
+  ]
+}

@@ -1,4 +1,8 @@
-# Docker Compose 测试输入
+# Docker Compose 部署与测试
+
+全部流程的 Bash 容器 CLI、批量入口及独立验签见 [Docker 使用指南](docker-workflows.md)，适用于 Linux 和 Windows Git Bash。`experiment-compose.sh` 的 Python 辅助工作已移入工具镜像，宿主机无需安装 Python；默认同时构建工具镜像和 CA 镜像，`--no-build` 需要两种镜像都已存在。
+
+本文件说明自研 CA 的本地签发/API 服务。独立 Krill、NGINX 和 rsync 仓库的部署见 [Krill Docker README](../docker/krill/README.md)，CA 注册与同步见 [Krill 接入指南](krill-publication.md)。
 
 复制环境变量示例并按需修改：
 
@@ -7,20 +11,35 @@ cp docker/.env.example docker/.env
 docker compose -f docker/compose.yaml up -d --build
 ```
 
+若要从统一的实验 JSON 自动完成启动服务、HTTP API 提交、快照导出和离线验证，可在项目根目录运行：
+
+```bash
+bash scripts/experiment-compose.sh \
+  --request examples/experiment.json \
+  --output ./data/experiments/compose-001
+```
+
+该脚本默认使用独立的 `data/compose-experiment` 持久 CA，并在完成后保持服务运行。它不会取代本地一次性入口 `scripts/experiment.sh`。完整说明见 [README 的 Compose/API 批量流程](../README.md#composeapi-批量签发与导出)。
+
 首次初始化开发用 TA 时读取以下变量：
 
 - `CA_DATA_DIR`：宿主机持久化目录，默认 `../data/docker`，绑定到容器的 `/var/lib/rpki`。
-- `REPOSITORY_URI`：仓库的公开 rsync 基础 URI，必须以 `/` 结尾。
+- `REPOSITORY_URI`：仓库的公开 rsync 基础 URI，建议以 `/` 结尾。
+- `CA_RENEW_BEFORE_DAYS`：证书到期预警窗口，默认 30 天。
 - `CA_NAME`：本地 CA 名称。
 - `DEVELOPMENT_CA_VALIDITY_DAYS`：开发 TA 证书有效天数。
 - `ROA_VALID_WEEKS`：ROA EE 证书有效周数，默认 52。
 - `ASPA_VALID_WEEKS`：ASPA EE 证书有效周数，默认 52。
+- `SISPI_VALID_WEEKS`：SiSPI EE 证书有效周数，默认 52。
 - `TOA_VALID_WEEKS`：实验性 TOA EE 证书有效周数，默认 52。
 - `TOA_REVIEW_DAYS`：TOA 运行复核周期，默认 90 天。
 - `PUBLISH_NEXT_HOURS`：Manifest/CRL 基础更新周期，默认 24 小时。
 - `PUBLISH_NEXT_JITTER_HOURS`：发布周期随机抖动上限，默认 4 小时。
 - `PUBLISH_HOURS_BEFORE_NEXT`：距离 `nextUpdate` 多久开始自动刷新，默认 8 小时。
 - `CA_RESOURCES`：空格分隔的 IPv4/IPv6 资源集合。这些资源决定该开发 TA 最多可以签发哪些 ROA 前缀。
+- `CA_AS_RESOURCES`：空格分隔的 ASN 资源，默认 `64496`；决定可以签发的 ASPA Customer ASN 和 SiSPI AS ID。
+
+`REPOSITORY_URI` 会被规范化为目录 URI，建议显式保留末尾 `/`；配置该变量不会启动 rsync、生成 RRDP 或自动接入 Krill。当前入口脚本不读取 RRDP notification 环境变量；使用 Krill 时，应先注册 publisher 并按接入指南创建和持久化配置好地址的 CA。
 
 容器内的 CA 目录固定为 `/var/lib/rpki/ca`，由 `CA_DATA_DIR` 指定的宿主机目录持久化。默认会写入仓库根目录的 `data/docker/ca`。上述初始化变量只在该目录中尚无 `ca.toml` 时生效。若要从头初始化，应先停止 Compose，再删除 `data/docker/ca`；该操作会永久删除测试 CA 的私钥、状态和已发布对象。
 
@@ -43,7 +62,7 @@ CA 会检查每个前缀是否被证书资源覆盖，并检查 `maxLength` 是�
 
 ## HTTP API
 
-Compose 默认在 `API_PORT`（默认 `3000`）启动 API。`API_TOKEN` 是必填的 Bearer Token；若前端跨域访问，可把 `CORS_ORIGIN` 设置为前端的精确来源，例如 `http://localhost:5173`。
+Compose 把 API 绑定到宿主机 `127.0.0.1:${API_PORT}`（默认端口 `3000`），容器内监听 `0.0.0.0:3000`。`API_TOKEN` 是必填的 Bearer Token；若前端跨域访问，可把 `CORS_ORIGIN` 设置为前端的精确来源，例如 `http://localhost:5173`。
 
 ```bash
 API_TOKEN="与 docker/.env 中 API_TOKEN 相同的值"
@@ -52,10 +71,14 @@ curl --request POST http://localhost:3000/api/v1/roas \
   --header "Authorization: Bearer ${API_TOKEN}" \
   --header "Content-Type: application/json" \
   --data '{
-    "asn": 64496,
-    "prefixes": [
-      { "prefix": "192.0.2.0/24", "max_length": 24 }
-    ]
+    "added": [
+      {
+        "asn": 64496,
+        "prefix": "192.0.2.0/24",
+        "max_length": 24
+      }
+    ],
+    "removed": []
   }'
 ```
 
@@ -64,11 +87,13 @@ curl --request POST http://localhost:3000/api/v1/roas \
 - `GET /healthz`：无需鉴权的健康检查。
 - `GET /api/v1/roas`、`POST /api/v1/roas`：列出授权配置或原子应用 `{added, removed}`，ROA 不使用 `Idempotency-Key`。
 - `GET/POST /api/v1/aspas`、`GET/DELETE /api/v1/aspas/{customer_asn}`：列出、批量增删、查询或撤回 ASPA；批量请求使用 `{added, removed}`，无需 `Idempotency-Key`。
-- `GET/POST /api/v1/toas`、`GET/DELETE /api/v1/toas/{key}`：列出、创建、查询或撤回 TOA。
-- `GET/POST /api/v1/sispis`、`GET/DELETE /api/v1/sispis/{as_id}`：列出、批量增删、查询或撤回 SiSPI；批量请求使用 `{added, removed}`，无需 `Idempotency-Key`。
+- `GET/POST /api/v1/toas`、`GET/DELETE /api/v1/toas/{key}`：列出、批量增删、查询或撤回 TOA；批量请求使用 `{added, removed}`，其中每项包含完整的 `asns` 和 `prefixes`。
+- `GET/POST /api/v1/sispis`、`GET/DELETE /api/v1/sispis/{asn}`：列出、批量增删、查询或撤回 SiSPI；批量请求使用 `{added, removed}`，无需 `Idempotency-Key`。
 - `GET /api/v1/toas/reviews`、`POST /api/v1/toas/{name}/reviews`：查询和记录 TOA 定期运行复核。
 - `DELETE /api/v1/signed-objects/{name}`：按后端当前签发清单中的发布文件名撤回 ASPA、TOA 或 SiSPI，同时更新 CRL 和 Manifest；ROA 通过授权配置增量移除，不依赖 `Idempotency-Key`。
 - `POST /api/v1/ca/validation-context`：更新导入 RC 的 TAL 和父级发布快照。
-- `GET /repository/{name}`：下载公开的 RPKI 仓库对象。
+- `GET /repository/{name}`：下载本地公开的 RPKI 仓库对象，无需鉴权。
+
+CA 信息、资源、换证、对象详情、验证和实验快照等完整接口见 [HTTP API](http-api.md)。服务每 10 分钟检查本地 CRL/Manifest 是否需要刷新，并检查 CA 到期和 TOA 复核状态；这些操作不自动同步到 Krill。
 
 ASPA 和 SiSPI 按稳定逻辑身份、TOA 按规范化内容摘要在后端实现幂等；重复提交相同目标状态不会重新签发。所有写接口均不要求 `Idempotency-Key`。写请求在进程内串行执行，并继续使用 CA 的文件锁保护底层状态。

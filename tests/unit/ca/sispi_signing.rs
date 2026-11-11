@@ -15,7 +15,7 @@ fn sispi_batch_replay_does_not_reissue_objects() {
     let ca = crate::CaManager::init(dir.path(), config).unwrap();
     let delta = crate::SispiDelta {
         added: vec![SispiRequest {
-            as_id: 64496,
+            asn: 64496,
             addresses: vec!["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()],
         }],
         removed: vec![],
@@ -56,7 +56,7 @@ fn signs_and_validates_draft_sispi_publication() {
     };
     let ca = crate::CaManager::init(dir.path(), config).unwrap();
     let request = SispiRequest {
-        as_id: 64496,
+        asn: 64496,
         addresses: vec![
             "2001:db8::1".parse().unwrap(),
             "192.0.2.1".parse().unwrap(),
@@ -81,7 +81,7 @@ fn signs_and_validates_draft_sispi_publication() {
         .unwrap();
     let object_ski = object.cert().subject_key_identifier();
     let (ee, content) = object.process(&issuer, |_| Ok(())).unwrap();
-    assert_eq!(content.as_id(), 64496.into());
+    assert_eq!(content.asn(), 64496.into());
     assert_eq!(
         content.v4_addresses(),
         &[rpki::repository::resources::Prefix::new(
@@ -117,7 +117,7 @@ fn signs_and_validates_draft_sispi_publication() {
 }
 
 #[test]
-fn rejects_sispi_as_id_outside_ca_resources() {
+fn rejects_sispi_asn_outside_ca_resources() {
     let dir = tempfile::tempdir().unwrap();
     let config = CaConfig {
         development_asns: vec![64496],
@@ -127,7 +127,7 @@ fn rejects_sispi_as_id_outside_ca_resources() {
     let error = ca
         .sign_sispi(
             &SispiRequest {
-                as_id: 64497,
+                asn: 64497,
                 addresses: vec!["192.0.2.1".parse().unwrap()],
             },
             "test.sav",

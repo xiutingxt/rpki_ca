@@ -11,4 +11,4 @@ pub use roa::{
     RoaDeltaResponse, RoaPayload, RoaRequest,
 };
 pub use sispi::{SispiDelta, SispiRequest};
-pub use toa::ToaRequest;
+pub use toa::{ToaDelta, ToaRequest};

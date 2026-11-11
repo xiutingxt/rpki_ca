@@ -1,14 +1,14 @@
 use super::{
-    args::{Command, parse_command, print_help},
+    args::{Command, PublisherCommand, parse_command, print_help},
     io::{ensure_external_export, read_file, read_files},
 };
-use anyhow::{Context, Result};
-use rpki_ca::{
+use crate::{
     AspaRequest, CaCertificateRenewal, CaConfig, CaImportRequest, CaManager,
     CaValidationContextUpdate, IssuanceTimingConfig, ObjectDefinition, RoaDelta, RoaRequest,
     SispiRequest, ToaRequest, api, verify_aspa_publication, verify_roa_publication,
     verify_sispi_publication, verify_toa_publication,
 };
+use anyhow::{Context, Result};
 use std::fs;
 
 pub(crate) fn run() -> Result<()> {
@@ -18,7 +18,93 @@ pub(crate) fn run() -> Result<()> {
     };
 
     match command {
+        Command::Publisher { command } => match command {
+            PublisherCommand::Init {
+                publisher_dir,
+                handle,
+            } => {
+                crate::publisher::init(&publisher_dir, &handle)?;
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "initialized", "request": publisher_dir.join("publisher-request.xml")})
+                );
+            }
+            PublisherCommand::Configure {
+                publisher_dir,
+                response,
+                ca_config_output,
+                allow_http,
+            } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::publisher::configure(
+                        &publisher_dir,
+                        &response,
+                        ca_config_output.as_deref(),
+                        allow_http
+                    )?)?
+                );
+            }
+            PublisherCommand::Sync {
+                publisher_dir,
+                dir,
+                dry_run,
+                allow_http,
+                tls_ca,
+                timeout_seconds,
+            } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::publisher::sync(
+                        &publisher_dir,
+                        &dir,
+                        dry_run,
+                        allow_http,
+                        tls_ca.as_deref(),
+                        timeout_seconds
+                    )?)?
+                );
+            }
+        },
+        Command::CaInfo { dir } => {
+            println!("{}", serde_json::to_string_pretty(&crate::ca_info(&dir)?)?);
+        }
+        Command::CheckConfig { config } => {
+            let config = CaConfig::from_file(&config)?;
+            config.validate_development()?;
+            println!(
+                "{}",
+                serde_json::json!({"status": "valid", "effective_config": config})
+            );
+        }
+        Command::ExportExperiment { dir, output } => {
+            let (valid, report) = crate::experiment::export(&dir, &output)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            anyhow::ensure!(
+                valid,
+                "snapshot exported but validation failed; see JSON report"
+            );
+        }
+        Command::Experiment {
+            request,
+            output,
+            valid_days,
+        } => {
+            let mut request: crate::experiment::ExperimentRequest =
+                serde_json::from_slice(&read_file(&request)?)?;
+            if let Some(days) = valid_days {
+                request.valid_days = days;
+            }
+            let report = crate::experiment::create(&request, &output)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::VerifyExperiment { dir, tal } => {
+            let (valid, report) = crate::experiment::verification_report(&dir, tal.as_deref());
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            anyhow::ensure!(valid, "experiment validation failed; see JSON report");
+        }
         Command::Init {
+            config: config_file,
             dir,
             repository_uri,
             name,
@@ -35,30 +121,35 @@ pub(crate) fn run() -> Result<()> {
             resources,
             asn_resources,
         } => {
-            let config = CaConfig {
-                name,
-                repository_uri,
-                // CaManager replaces this with the RFC 6481 key-derived URI
-                // after generating the development CA key.
-                certificate_uri: String::new(),
-                development_ca_validity_days,
-                ca_renew_before_days,
-                timing: IssuanceTimingConfig {
-                    roa_valid_weeks,
-                    aspa_valid_weeks,
-                    sispi_valid_weeks,
-                    toa_valid_weeks,
-                    toa_review_days,
-                    publish_next_hours,
-                    publish_next_jitter_hours,
-                    publish_hours_before_next,
-                },
-                development_resources: if resources.is_empty() {
-                    CaConfig::default().development_resources
-                } else {
-                    resources
-                },
-                development_asns: asn_resources,
+            let config = if let Some(path) = config_file {
+                CaConfig::from_file(&path)?
+            } else {
+                CaConfig {
+                    name,
+                    repository_uri,
+                    // CaManager replaces this with the RFC 6481 key-derived URI
+                    // after generating the development CA key.
+                    certificate_uri: String::new(),
+                    rrdp_notification_uri: None,
+                    development_ca_validity_days,
+                    ca_renew_before_days,
+                    timing: IssuanceTimingConfig {
+                        roa_valid_weeks,
+                        aspa_valid_weeks,
+                        sispi_valid_weeks,
+                        toa_valid_weeks,
+                        toa_review_days,
+                        publish_next_hours,
+                        publish_next_jitter_hours,
+                        publish_hours_before_next,
+                    },
+                    development_resources: if resources.is_empty() {
+                        CaConfig::default().development_resources
+                    } else {
+                        resources
+                    },
+                    development_asns: asn_resources,
+                }
             };
             CaManager::init(&dir, config)?;
             println!("CA initialized in {}", dir.display());
@@ -236,12 +327,12 @@ pub(crate) fn run() -> Result<()> {
         }
         Command::SignSispi {
             dir,
-            as_id,
+            asn,
             addresses,
             output,
         } => {
             ensure_external_export(&dir, &output)?;
-            let request = SispiRequest { as_id, addresses };
+            let request = SispiRequest { asn, addresses };
             let logical_name = output
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -249,7 +340,7 @@ pub(crate) fn run() -> Result<()> {
             let manager = CaManager::open(&dir)?;
             let bytes = manager.sign_sispi(&request, logical_name)?;
             let published_name = manager
-                .published_name(&format!("sispi:AS{as_id}"))?
+                .published_name(&format!("sispi:AS{asn}"))?
                 .context("signed SiSPI is missing from CA state")?;
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
@@ -294,8 +385,8 @@ pub(crate) fn run() -> Result<()> {
                 }
             );
         }
-        Command::WithdrawSispi { dir, as_id } => {
-            let changed = CaManager::open(dir)?.withdraw_sispi(as_id)?;
+        Command::WithdrawSispi { dir, asn } => {
+            let changed = CaManager::open(dir)?.withdraw_sispi(asn)?;
             println!(
                 "SiSPI withdrawal: {}",
                 if changed {
@@ -390,10 +481,10 @@ pub(crate) fn run() -> Result<()> {
         Command::VerifySispi {
             dir,
             object,
-            as_id,
+            asn,
             addresses,
         } => {
-            for line in verify_sispi_publication(&dir, &object, as_id, &addresses)? {
+            for line in verify_sispi_publication(&dir, &object, asn, &addresses)? {
                 println!("[PASS] {line}");
             }
             println!("RESULT: PASS - SiSPI publication set is internally consistent");

@@ -4,7 +4,11 @@ use crate::{ToaRequest, infrastructure::repository::PublicationRepository};
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 use rpki::repository::roa::Roa;
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 #[derive(Debug)]
 pub(crate) struct ToaRoaOverlapJustificationRequired {
@@ -31,13 +35,16 @@ pub(crate) struct ToaRoaAssessment {
     pub covering_roas: BTreeSet<String>,
 }
 
-impl ToaRoaAssessment {
-    pub fn evaluate(
-        repository: &dyn PublicationRepository,
-        roa_names: &[String],
-        request: &ToaRequest,
-    ) -> Result<Self> {
-        let mut authorizations = Vec::new();
+/// A request-local snapshot, built while the CA state lock is held. Never
+/// retained across writes, so ROA changes cannot leave stale coverage results.
+#[derive(Default)]
+pub(crate) struct ToaRoaIndex {
+    by_asn: BTreeMap<u32, Vec<RoaAuthorization>>,
+}
+
+impl ToaRoaIndex {
+    pub fn load(repository: &dyn PublicationRepository, roa_names: &[String]) -> Result<Self> {
+        let mut index = Self::default();
         for name in roa_names {
             let bytes = repository
                 .read(name)
@@ -46,7 +53,7 @@ impl ToaRoaAssessment {
                 .with_context(|| format!("cannot decode existing ROA {name}"))?;
             let asn = u32::from(roa.content().as_id());
             for prefix in roa.content().iter() {
-                authorizations.push(RoaAuthorization {
+                index.by_asn.entry(asn).or_default().push(RoaAuthorization {
                     asn,
                     prefix: IpNet::new(prefix.address(), prefix.address_length())
                         .expect("strictly decoded ROA prefix is valid"),
@@ -55,16 +62,22 @@ impl ToaRoaAssessment {
                 });
             }
         }
+        Ok(index)
+    }
 
+    pub fn evaluate(&self, request: &ToaRequest) -> ToaRoaAssessment {
         let asns = request.canonical_asns();
         let prefixes = request.canonical_prefixes();
         let total_pairs = asns.len().saturating_mul(prefixes.len());
         let mut covered_pairs = 0;
         let mut covering_roas = BTreeSet::new();
         for asn in asns {
+            let Some(authorizations) = self.by_asn.get(&asn) else {
+                continue;
+            };
             for prefix in &prefixes {
                 let mut covered = false;
-                for authorization in &authorizations {
+                for authorization in authorizations {
                     if authorization.covers(asn, prefix) {
                         covered = true;
                         covering_roas.insert(authorization.name.clone());
@@ -73,11 +86,21 @@ impl ToaRoaAssessment {
                 covered_pairs += usize::from(covered);
             }
         }
-        Ok(Self {
+        ToaRoaAssessment {
             total_pairs,
             covered_pairs,
             covering_roas,
-        })
+        }
+    }
+}
+
+impl ToaRoaAssessment {
+    pub fn evaluate(
+        repository: &dyn PublicationRepository,
+        roa_names: &[String],
+        request: &ToaRequest,
+    ) -> Result<Self> {
+        Ok(ToaRoaIndex::load(repository, roa_names)?.evaluate(request))
     }
 
     pub fn enforce(&self, request: &ToaRequest) -> Result<Vec<String>> {

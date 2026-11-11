@@ -63,16 +63,7 @@ pub(super) fn summarize(name: String, bytes: &[u8], withdrawable: bool) -> Repos
 
 pub(super) fn inspect(name: String, bytes: Vec<u8>) -> Result<RepositoryInspection> {
     let object_kind = kind(&name);
-    let decoded = match object_kind {
-        "ca_certificate" => inspect_certificate(&bytes)?,
-        "crl" => inspect_crl(&bytes)?,
-        "manifest" => inspect_manifest(&bytes)?,
-        "roa" => inspect_roa(&bytes)?,
-        "aspa" => inspect_aspa(&bytes)?,
-        "toa" => inspect_toa(&bytes)?,
-        "sispi" => inspect_sispi(&bytes)?,
-        _ => bail!("unsupported repository object type"),
-    };
+    let decoded = decode(&name, &bytes)?;
     Ok(RepositoryInspection {
         name,
         kind: object_kind,
@@ -81,6 +72,20 @@ pub(super) fn inspect(name: String, bytes: Vec<u8>) -> Result<RepositoryInspecti
         content_base64: STANDARD.encode(&bytes),
         decoded,
     })
+}
+
+/// Decode actual repository bytes without the HTTP response envelope.
+pub(crate) fn decode(name: &str, bytes: &[u8]) -> Result<Value> {
+    match kind(name) {
+        "ca_certificate" => inspect_certificate(bytes),
+        "crl" => inspect_crl(bytes),
+        "manifest" => inspect_manifest(bytes),
+        "roa" => inspect_roa(bytes),
+        "aspa" => inspect_aspa(bytes),
+        "toa" => inspect_toa(bytes),
+        "sispi" => inspect_sispi(bytes),
+        _ => bail!("unsupported repository object type"),
+    }
 }
 
 fn inspect_certificate(bytes: &[u8]) -> Result<Value> {
@@ -392,7 +397,7 @@ fn inspect_sispi(bytes: &[u8]) -> Result<Value> {
         "cms": signed_object_fields(bytes, sispi.cert(), "id-ct-rpkiSiSPI", crate::constants::SISPI_CONTENT_TYPE_OID)?,
         "eContent": {
             "version": 0,
-            "asID": u32::from(sispi.content().as_id()),
+            "asn": u32::from(sispi.content().asn()),
             "addresses": prefix_address_families(
                 sispi.content().v4_addresses(),
                 sispi.content().v6_addresses(),

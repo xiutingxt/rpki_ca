@@ -1,7 +1,7 @@
 //! Validation of published RPKI objects.
 
-mod publication;
-mod publication_set;
+pub(crate) mod publication;
+pub(crate) mod publication_set;
 mod report;
 
 pub use publication::{

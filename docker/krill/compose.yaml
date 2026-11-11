@@ -1,0 +1,40 @@
+# Optional standalone repository. Existing docker/compose.yaml is unchanged.
+# This profile uses localhost URIs for validators and the publisher on the host.
+services:
+  krill:
+    image: nlnetlabs/krill:v0.16.0
+    environment:
+      KRILL_ADMIN_TOKEN: ${KRILL_ADMIN_TOKEN:?set KRILL_ADMIN_TOKEN in .env}
+    volumes:
+      - krill-data:/var/krill/data
+      - ./krill.conf:/var/krill/data/krill.conf:ro
+    restart: unless-stopped
+
+  web:
+    image: ${KRILL_NGINX_IMAGE:-nginx:1.28-bookworm}
+    ports:
+      - "127.0.0.1:3443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./tls:/etc/nginx/tls:ro
+      # Mount the whole data root, never the replaceable rsync/current directory.
+      - krill-data:/var/krill/data:ro
+    depends_on:
+      - krill
+    restart: unless-stopped
+
+  rsync:
+    build:
+      context: .
+      dockerfile: rsync.Dockerfile
+    ports:
+      - "127.0.0.1:873:873"
+    volumes:
+      - krill-data:/var/krill/data:ro
+      - ./rsyncd.conf:/etc/rsyncd.conf:ro
+    depends_on:
+      - krill
+    restart: unless-stopped
+
+volumes:
+  krill-data:

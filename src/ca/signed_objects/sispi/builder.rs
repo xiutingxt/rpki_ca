@@ -16,9 +16,9 @@ pub(super) struct SispiBuilder {
 }
 
 impl SispiBuilder {
-    pub fn new(as_id: Asn, v4_addresses: Vec<Prefix>, v6_addresses: Vec<Prefix>) -> Self {
+    pub fn new(asn: Asn, v4_addresses: Vec<Prefix>, v6_addresses: Vec<Prefix>) -> Self {
         Self {
-            content: SispiContent::new(as_id, v4_addresses, v6_addresses),
+            content: SispiContent::new(asn, v4_addresses, v6_addresses),
         }
     }
 

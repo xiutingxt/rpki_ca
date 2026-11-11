@@ -5,7 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --locked --release
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS runtime-base
 
 COPY --from=builder /build/target/release/rpki-ca /usr/local/bin/rpki-ca
 COPY docker/entrypoint.sh /usr/local/bin/rpki-ca-entrypoint
@@ -23,3 +23,9 @@ EXPOSE 3000
 VOLUME ["/var/lib/rpki"]
 ENTRYPOINT ["/usr/local/bin/rpki-ca-entrypoint"]
 CMD ["idle"]
+
+FROM runtime-base AS tools
+RUN apt-get update && apt-get install -y --no-install-recommends python3 bash openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY scripts/experiment_compose.py scripts/independent_verify.py /opt/rpki-tools/
+
+FROM runtime-base AS runtime

@@ -9,22 +9,22 @@ use rpki::repository::{
 };
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SispiContent {
-    as_id: Asn,
+    asn: Asn,
     v4_addresses: Vec<Prefix>,
     v6_addresses: Vec<Prefix>,
 }
 
 impl SispiContent {
-    pub(super) fn new(as_id: Asn, v4_addresses: Vec<Prefix>, v6_addresses: Vec<Prefix>) -> Self {
+    pub(super) fn new(asn: Asn, v4_addresses: Vec<Prefix>, v6_addresses: Vec<Prefix>) -> Self {
         Self {
-            as_id,
+            asn,
             v4_addresses,
             v6_addresses,
         }
     }
 
-    pub fn as_id(&self) -> Asn {
-        self.as_id
+    pub fn asn(&self) -> Asn {
+        self.asn
     }
 
     pub fn v4_addresses(&self) -> &[Prefix] {
@@ -37,7 +37,7 @@ impl SispiContent {
 
     pub(super) fn as_resources(&self) -> AsResources {
         let mut resources = AsResourcesBuilder::new();
-        resources.blocks(|blocks| blocks.push(AsBlock::Id(self.as_id)));
+        resources.blocks(|blocks| blocks.push(AsBlock::Id(self.asn)));
         resources.finalize()
     }
 
@@ -52,7 +52,7 @@ impl SispiContent {
                 return Err(cons
                     .content_err("SiSPI version 0 is a DEFAULT value and must be omitted in DER"));
             }
-            let as_id = Asn::take_from(cons)?;
+            let asn = Asn::take_from(cons)?;
             let mut v4_addresses = Vec::new();
             let mut v6_addresses = Vec::new();
             cons.take_sequence(|families| {
@@ -86,7 +86,7 @@ impl SispiContent {
                 Ok(())
             })?;
             Ok(Self {
-                as_id,
+                asn,
                 v4_addresses,
                 v6_addresses,
             })
@@ -113,27 +113,27 @@ impl SispiContent {
     }
 
     pub(super) fn verify_resources(&self, cert: &ResourceCert) -> Result<(), VerificationError> {
-        if !cert.as_resources().contains_asn(self.as_id) {
+        if !cert.as_resources().contains_asn(self.asn) {
             return Err(VerificationError::new(format!(
                 "SiSPI AS{} is not covered by its EE certificate",
-                self.as_id.into_u32()
+                self.asn.into_u32()
             )));
         }
         Ok(())
     }
 
     pub(super) fn encode_ref(&self) -> impl Values + '_ {
-        encode_content(self.as_id, &self.v4_addresses, &self.v6_addresses)
+        encode_content(self.asn, &self.v4_addresses, &self.v6_addresses)
     }
 }
 
 fn encode_content<'a>(
-    as_id: Asn,
+    asn: Asn,
     v4_addresses: &'a [Prefix],
     v6_addresses: &'a [Prefix],
 ) -> impl Values + 'a {
     encode::sequence((
-        as_id.encode(),
+        asn.encode(),
         encode::sequence((
             encode_family(AddressFamily::Ipv4, v4_addresses),
             encode_family(AddressFamily::Ipv6, v6_addresses),

@@ -13,7 +13,7 @@ use rpki::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) struct PublicationSet {
+pub(crate) struct PublicationSet {
     objects: BTreeMap<String, Vec<u8>>,
     pub ca: ResourceCert,
     pub crl: Crl,
@@ -144,6 +144,30 @@ impl PublicationSet {
 
     pub fn object_bytes(&self, name: &str) -> Result<Vec<u8>> {
         read(&self.objects, name)
+    }
+
+    /// Return only a complete validated publication inventory. The issuing CA
+    /// certificate and Manifest are the two files not required as manifest members.
+    pub fn publication_files(&self) -> Result<BTreeMap<String, Vec<u8>>> {
+        let mut expected = self
+            .manifest
+            .iter()
+            .map(|entry| std::str::from_utf8(entry.file()).map(str::to_owned))
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        expected.insert(publication::key_filename(
+            &self.ca.subject_key_identifier(),
+            "cer",
+        ));
+        expected.insert(publication::key_filename(
+            &self.ca.subject_key_identifier(),
+            "mft",
+        ));
+        let actual = self.objects.keys().cloned().collect::<BTreeSet<_>>();
+        ensure!(
+            expected == actual,
+            "repository contains files not listed by current Manifest"
+        );
+        Ok(self.objects.clone())
     }
 }
 

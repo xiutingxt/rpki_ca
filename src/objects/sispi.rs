@@ -7,12 +7,12 @@ use std::net::IpAddr;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SispiRequest {
-    pub as_id: u32,
+    pub asn: u32,
     pub addresses: Vec<IpAddr>,
 }
 
 /// A batch update of SiSPI definitions. Entries in `added` create or replace
-/// the definition identified by their AS ID. Unknown removals and definitions
+/// the definition identified by their ASN. Unknown removals and definitions
 /// that already have the requested content are harmless no-ops.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
